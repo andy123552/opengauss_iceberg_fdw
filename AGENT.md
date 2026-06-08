@@ -22,16 +22,16 @@
 ## 后续上下文入口
 
 - 项目总览：`README.md`
-- openGauss 源码目录：计划放在 `openGauss-server/`
+- openGauss 源码参考树：`openGauss-server/`
+- openGauss 参考提交：`75f983eb0e7bbd7725eb317aba613f42337759e5`
 - 构建记录：后续记录到 `build-notes.md`
 - 设计记录：后续可新增 `design/` 目录
 - 接口适配记录：后续可新增 `interfaces/` 目录
 
 ## 后续优先事项
 
-1. 完成 openGauss 源码拉取、编译和本地实例拉起。
-2. 梳理 FDW callback 和已有 FDW 扩展示例。
+1. 使用 `openGauss-server/` 作为 FDW callback 和 contrib 实现的代码对比参考。
+2. 确认或修复 Docker 方式的本地 openGauss 运行环境。
 3. 等待团队接口定义后补齐接口适配设计。
 4. 实现最小 Iceberg FDW extension 骨架。
 5. 分阶段接入索引扫描和 delta DML 写入。
-

@@ -18,8 +18,10 @@ interface constraints, and follow existing openGauss FDW code patterns first.
 ## Local Layout
 
 - Project root: `/home/andy/opengauss_iceberg_fdw`
-- Runtime mode: use the Docker image in `docker-compose.yml`; do not fetch or
-  compile the openGauss source tree by default.
+- openGauss source reference tree: `openGauss-server/`
+- Source reference commit: `75f983eb0e7bbd7725eb317aba613f42337759e5`
+- Runtime mode: use the Docker image in `docker-compose.yml`; do not compile
+  the openGauss source tree by default.
 - Main project overview: `README.md`
 - Original context note: `AGENT.md`
 - Docker service: `opengauss`
@@ -58,8 +60,9 @@ interface constraints, and follow existing openGauss FDW code patterns first.
 
 ## Likely Next Steps
 
-1. Confirm or repair local openGauss build environment.
-2. Review FDW callback definitions and contrib implementations.
+1. Use `openGauss-server/` as a source reference for FDW callback and contrib
+   implementation comparisons.
+2. Confirm or repair local Docker-based openGauss runtime environment.
 3. Record team-provided Iceberg metadata, index scan, and delta write APIs when
    available.
 4. Implement a minimal Iceberg FDW extension skeleton.
