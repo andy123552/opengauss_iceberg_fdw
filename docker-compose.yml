@@ -1,0 +1,16 @@
+services:
+  opengauss:
+    image: opengauss/opengauss-server:latest
+    container_name: opengauss-iceberg-fdw
+    privileged: true
+    ports:
+      - "15432:5432"
+    environment:
+      GS_PASSWORD: "openGauss@123"
+      TZ: "Asia/Shanghai"
+    volumes:
+      - ./docker-data/opengauss:/var/lib/opengauss
+    mem_limit: 2g
+    memswap_limit: 2g
+    restart: unless-stopped
+

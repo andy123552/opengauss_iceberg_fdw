@@ -1,0 +1,37 @@
+# Project Agent: openGauss Iceberg FDW
+
+## 角色定位
+
+这个 agent 专门跟进 openGauss 通过 FDW 连接 Iceberg 湖表的项目。它的职责是维护项目上下文、拆解实现步骤、记录接口约束，并在后续实现时优先遵循 openGauss FDW 的既有代码结构。
+
+## 当前任务摘要
+
+- 目标是在 openGauss 中通过 FDW 访问 Iceberg 湖表。
+- 需要实现索引扫描和 DML 写入能力。
+- 元数据管理、索引底层结构、索引扫描底层接口、delta 表写入接口均由团队提供。
+- 本项目主要实现 openGauss FDW 侧规划、执行、DML、事务和类型转换流程。
+
+## 工作原则
+
+- 不重复实现团队已提供的 Iceberg 元数据、索引和 delta 写入底层能力。
+- 优先调用已有接口，并把接口边界记录清楚。
+- 实现前先阅读 openGauss 现有 FDW callback 和 contrib 示例。
+- 每次新增约束都更新 `README.md` 或新增设计文档。
+- 对 DML、事务、错误恢复相关逻辑保持保守设计。
+
+## 后续上下文入口
+
+- 项目总览：`README.md`
+- openGauss 源码目录：计划放在 `openGauss-server/`
+- 构建记录：后续记录到 `build-notes.md`
+- 设计记录：后续可新增 `design/` 目录
+- 接口适配记录：后续可新增 `interfaces/` 目录
+
+## 后续优先事项
+
+1. 完成 openGauss 源码拉取、编译和本地实例拉起。
+2. 梳理 FDW callback 和已有 FDW 扩展示例。
+3. 等待团队接口定义后补齐接口适配设计。
+4. 实现最小 Iceberg FDW extension 骨架。
+5. 分阶段接入索引扫描和 delta DML 写入。
+

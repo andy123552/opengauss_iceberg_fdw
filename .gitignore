@@ -1,0 +1,6 @@
+docker-data/
+.agents/
+.codex/
+openGauss-server/
+openGauss-server.incomplete-gitee/
+openGauss-server.incomplete-gitee-2/
