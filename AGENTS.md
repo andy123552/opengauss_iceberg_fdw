@@ -19,7 +19,10 @@ interface constraints, and follow existing openGauss FDW code patterns first.
 
 - Project root: `/home/andy/opengauss_iceberg_fdw`
 - openGauss source reference tree: `openGauss-server/`
-- Source reference commit: `75f983eb0e7bbd7725eb317aba613f42337759e5`
+- Source reference repository:
+  `https://github.com/DataInfraLab/openGauss-server-datainfra`
+- Source clone notes: `design/source-reference.md`
+- FDW extension skeleton: `iceberg_fdw/`
 - Runtime mode: use the Docker image in `docker-compose.yml`; do not compile
   the openGauss source tree by default.
 - Main project overview: `README.md`

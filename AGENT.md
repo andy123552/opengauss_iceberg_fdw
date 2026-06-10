@@ -23,7 +23,9 @@
 
 - 项目总览：`README.md`
 - openGauss 源码参考树：`openGauss-server/`
-- openGauss 参考提交：`75f983eb0e7bbd7725eb317aba613f42337759e5`
+- openGauss 目标参考仓：`https://github.com/DataInfraLab/openGauss-server-datainfra`
+- 源码仓克隆说明：`design/source-reference.md`
+- FDW 基础代码目录：`iceberg_fdw/`
 - 构建记录：后续记录到 `build-notes.md`
 - 设计记录：后续可新增 `design/` 目录
 - 接口适配记录：后续可新增 `interfaces/` 目录
