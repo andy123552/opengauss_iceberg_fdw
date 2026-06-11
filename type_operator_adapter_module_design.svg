@@ -6,15 +6,15 @@
    role="img"
    aria-labelledby="title desc"
    version="1.1"
-   id="svg87"
+   id="svg78"
    sodipodi:docname="type_operator_adapter_module_design.svg"
-   inkscape:version="1.4.2 (f4327f4, 2025-05-13)"
+   inkscape:version="1.4.4 (dcaf3e7, 2026-05-05)"
    xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
    xmlns="http://www.w3.org/2000/svg"
    xmlns:svg="http://www.w3.org/2000/svg">
   <sodipodi:namedview
-     id="namedview87"
+     id="namedview78"
      pagecolor="#ffffff"
      bordercolor="#000000"
      borderopacity="0.25"
@@ -22,19 +22,19 @@
      inkscape:pageopacity="0.0"
      inkscape:pagecheckerboard="0"
      inkscape:deskcolor="#d1d1d1"
-     inkscape:zoom="1.4210938"
-     inkscape:cx="900.01096"
-     inkscape:cy="639.99998"
-     inkscape:window-width="3840"
-     inkscape:window-height="2054"
-     inkscape:window-x="-11"
-     inkscape:window-y="-11"
+     inkscape:zoom="0.91171875"
+     inkscape:cx="899.94859"
+     inkscape:cy="640"
+     inkscape:window-width="2560"
+     inkscape:window-height="1369"
+     inkscape:window-x="-8"
+     inkscape:window-y="-8"
      inkscape:window-maximized="1"
-     inkscape:current-layer="svg87" />
+     inkscape:current-layer="svg78" />
   <title
      id="title">type_adapter and operator_adapter module design</title>
   <desc
-     id="desc">Layered SVG module relationship diagram for openGauss Iceberg FDW full table scan, type conversion, predicate normalization, delta scan reservation, and recheck policy.</desc>
+     id="desc">Editable module relationship diagram for openGauss Iceberg FDW. Arrow batch flows through type_adapter before TupleSlot materialization. Delta table scan is modeled as openGauss scan integration.</desc>
   <defs
      id="defs5">
     <marker
@@ -51,6 +51,19 @@
          id="path1" />
     </marker>
     <marker
+       id="arrow-orange"
+       markerWidth="12"
+       markerHeight="12"
+       refX="10"
+       refY="6"
+       orient="auto"
+       markerUnits="strokeWidth">
+      <path
+         d="M2,2 L10,6 L2,10 Z"
+         fill="#ea580c"
+         id="path2" />
+    </marker>
+    <marker
        id="arrow-green"
        markerWidth="12"
        markerHeight="12"
@@ -61,19 +74,6 @@
       <path
          d="M2,2 L10,6 L2,10 Z"
          fill="#15803d"
-         id="path2" />
-    </marker>
-    <marker
-       id="arrow-amber"
-       markerWidth="12"
-       markerHeight="12"
-       refX="10"
-       refY="6"
-       orient="auto"
-       markerUnits="strokeWidth">
-      <path
-         d="M2,2 L10,6 L2,10 Z"
-         fill="#d97706"
          id="path3" />
     </marker>
     <marker
@@ -105,55 +105,28 @@
     <style
        id="style5">
       .bg { fill: #f8fafc; }
-      .title { font: 700 32px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #0f172a; }
-      .subtitle { font: 400 16px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #475569; }
-      .band-label { font: 700 18px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #334155; }
-      .box-title { font: 700 20px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #0f172a; }
-      .box-sub { font: 400 15px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #334155; }
-      .small { font: 400 14px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #475569; }
-      .note-title { font: 700 16px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #0f172a; }
-      .note { font: 400 14px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #334155; }
-      .code { font: 600 14px Consolas, &quot;Microsoft YaHei&quot;, monospace; fill: #1e293b; }
-      .band { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1.5; rx: 14; }
-      .og { fill: #eff6ff; stroke: #93c5fd; stroke-width: 1.5; rx: 12; }
-      .hook { fill: #ecfeff; stroke: #67e8f9; stroke-width: 1.5; rx: 12; }
-      .adapter { fill: #f0fdf4; stroke: #86efac; stroke-width: 1.5; rx: 12; }
-      .focus { fill: #fff7ed; stroke: #fdba74; stroke-width: 2; rx: 12; }
-      .scan { fill: #f5f3ff; stroke: #c4b5fd; stroke-width: 1.5; rx: 12; }
-      .external { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; rx: 12; }
-      .plan { fill: #fffbeb; stroke: #fbbf24; stroke-width: 1.5; rx: 12; }
-      .line-blue { fill: none; stroke: #2563eb; stroke-width: 2.2; marker-end: url(#arrow-blue); }
-      .line-green { fill: none; stroke: #15803d; stroke-width: 2.2; marker-end: url(#arrow-green); }
-      .line-amber { fill: none; stroke: #d97706; stroke-width: 2.2; marker-end: url(#arrow-amber); }
-      .line-red { fill: none; stroke: #dc2626; stroke-width: 2.2; marker-end: url(#arrow-red); stroke-dasharray: 5 5; }
-      .line-purple { fill: none; stroke: #7c3aed; stroke-width: 2.2; marker-end: url(#arrow-purple); stroke-dasharray: 8 7; }
+      .title { font: 700 30px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 15px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #475569; }
+      .layer { fill: #ffffff; stroke: #dbe3ef; stroke-width: 1.4; }
+      .layer-title { font: 700 17px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #334155; }
+      .box-title { font: 700 19px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #111827; }
+      .box-sub { font: 400 14px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #334155; }
+      .small { font: 600 12px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #334155; }
+      .note { font: 400 13px &quot;Microsoft YaHei&quot;, &quot;Noto Sans CJK SC&quot;, Arial, sans-serif; fill: #475569; }
+      .call { fill: #eff6ff; stroke: #60a5fa; stroke-width: 1.5; }
+      .hook { fill: #ecfeff; stroke: #22d3ee; stroke-width: 1.5; }
+      .catalog { fill: #f0fdf4; stroke: #4ade80; stroke-width: 1.5; }
+      .adapter { fill: #fff7ed; stroke: #fb923c; stroke-width: 1.5; }
+      .plan { fill: #fefce8; stroke: #facc15; stroke-width: 1.5; }
+      .scan { fill: #eef2ff; stroke: #6366f1; stroke-width: 1.6; }
+      .provider { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.4; }
+      .legend { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.4; }
+      .arrow-blue { fill: none; stroke: #2563eb; stroke-width: 2.4; marker-end: url(#arrow-blue); }
+      .arrow-orange { fill: none; stroke: #ea580c; stroke-width: 2.4; marker-end: url(#arrow-orange); }
+      .arrow-green { fill: none; stroke: #15803d; stroke-width: 2.4; marker-end: url(#arrow-green); }
+      .arrow-red { fill: none; stroke: #dc2626; stroke-width: 2.1; stroke-dasharray: 6 6; marker-end: url(#arrow-red); }
+      .arrow-purple { fill: none; stroke: #7c3aed; stroke-width: 2.1; stroke-dasharray: 8 6; marker-end: url(#arrow-purple); }
     </style>
-    <marker
-       id="arrow-red-0"
-       markerWidth="12"
-       markerHeight="12"
-       refX="10"
-       refY="6"
-       orient="auto"
-       markerUnits="strokeWidth">
-      <path
-         d="m 2,2 8,4 -8,4 z"
-         fill="#dc2626"
-         id="path4-9" />
-    </marker>
-    <marker
-       id="arrow-red-8"
-       markerWidth="12"
-       markerHeight="12"
-       refX="10"
-       refY="6"
-       orient="auto"
-       markerUnits="strokeWidth">
-      <path
-         d="m 2,2 8,4 -8,4 z"
-         fill="#dc2626"
-         id="path4-2" />
-    </marker>
   </defs>
   <rect
      class="bg"
@@ -164,618 +137,550 @@
      id="rect5" />
   <text
      class="title"
-     x="80"
-     y="60"
+     x="72"
+     y="54"
      id="text5">type_adapter / operator_adapter 模块关系设计图</text>
   <text
      class="subtitle"
-     x="80"
-     y="90"
-     id="text6">入口分为 openGauss 调用层与 FDW hook 入口层；当前图仅描述普通全表扫描，并保留 delta scan 替换分支。</text>
+     x="72"
+     y="82"
+     id="text6">核心路径：Iceberg SDK 产生 Arrow batch，必须先经过 type_adapter 转换，再进入 TupleSlot materializer。</text>
   <rect
-     class="band"
-     x="60"
-     y="125"
-     width="1680"
-     height="120"
+     class="layer"
+     x="56"
+     y="112"
+     width="1688"
+     height="104"
      id="rect6" />
   <text
-     class="band-label"
-     x="85"
-     y="154"
+     class="layer-title"
+     x="80"
+     y="140"
      id="text7">1. openGauss 调用层</text>
   <rect
-     class="og"
-     x="170"
-     y="170"
-     width="510"
-     height="55"
+     class="call"
+     x="160"
+     y="154"
+     width="520"
+     height="52"
      id="rect7" />
   <text
      class="box-title"
-     x="200"
-     y="194"
+     x="190"
+     y="178"
      id="text8">Planner</text>
   <text
      class="box-sub"
-     x="200"
-     y="215"
-     id="text9">触发外表规划：行数估计、路径选择、ForeignScan 计划</text>
+     x="190"
+     y="198"
+     id="text9">行数估计、路径选择、ForeignScan 计划</text>
   <rect
-     class="og"
-     x="1120"
-     y="170"
-     width="510"
-     height="55"
+     class="call"
+     x="1110"
+     y="154"
+     width="520"
+     height="52"
      id="rect9" />
   <text
      class="box-title"
-     x="1150"
-     y="194"
+     x="1140"
+     y="178"
      id="text10">Executor</text>
   <text
      class="box-sub"
-     x="1150"
-     y="215"
-     id="text11">触发外表执行：打开扫描、逐批读取、返回 TupleSlot</text>
+     x="1140"
+     y="198"
+     id="text11">打开扫描、逐批读取、接收 TupleSlot</text>
   <rect
-     class="band"
-     x="60"
-     y="285"
-     width="1680"
-     height="150"
+     class="layer"
+     x="56"
+     y="250"
+     width="1688"
+     height="126"
      id="rect11" />
   <text
-     class="band-label"
-     x="85"
-     y="314"
+     class="layer-title"
+     x="80"
+     y="278"
      id="text12">2. iceberg_fdw hook 入口层</text>
   <rect
      class="hook"
-     x="140"
-     y="340"
-     width="600"
-     height="70"
+     x="130"
+     y="300"
+     width="620"
+     height="60"
      id="rect12" />
   <text
      class="box-title"
-     x="170"
-     y="365"
+     x="160"
+     y="326"
      id="text13">FDW planner hooks</text>
   <text
      class="box-sub"
-     x="170"
-     y="387"
+     x="160"
+     y="346"
      id="text14">GetForeignRelSize / GetForeignPaths / GetForeignPlan</text>
-  <text
-     class="small"
-     x="170"
-     y="405"
-     id="text15">输出：projection、remote predicate、local recheck qual、snapshot、fdw_private</text>
   <rect
      class="hook"
-     x="1060"
-     y="340"
-     width="600"
-     height="70"
-     id="rect15" />
+     x="1040"
+     y="300"
+     width="620"
+     height="60"
+     id="rect14" />
   <text
      class="box-title"
-     x="1090"
-     y="365"
-     id="text16">FDW executor hooks</text>
+     x="1070"
+     y="326"
+     id="text15">FDW executor hooks</text>
   <text
      class="box-sub"
-     x="1090"
-     y="387"
-     id="text17">BeginForeignScan / IterateForeignScan / EndForeignScan</text>
-  <text
-     class="small"
-     x="1090"
-     y="405"
-     id="text18">消费 fdw_private，构造 scan request，读取 Arrow batch 并转换为 slot</text>
-  <path
-     class="line-blue"
-     d="M425,225 L425,330"
-     id="path18" />
-  <path
-     class="line-blue"
-     d="M1375,225 L1375,330"
-     id="path19" />
+     x="1070"
+     y="346"
+     id="text16">BeginForeignScan / IterateForeignScan / EndForeignScan</text>
   <rect
-     class="band"
-     x="60"
-     y="470"
-     width="1680"
-     height="390"
-     id="rect19" />
+     class="layer"
+     x="56"
+     y="410"
+     width="1688"
+     height="330"
+     id="rect16" />
   <text
-     class="band-label"
-     x="85"
-     y="500"
-     id="text19">3. FDW 内部适配层（首期仅普通全表扫描）</text>
+     class="layer-title"
+     x="80"
+     y="438"
+     id="text17">3. FDW 内部适配层</text>
+  <rect
+     class="catalog"
+     x="100"
+     y="520"
+     width="310"
+     height="130"
+     id="rect17" />
+  <text
+     class="box-title"
+     x="130"
+     y="550"
+     id="text18">catalog_adapter</text>
+  <text
+     class="box-sub"
+     x="130"
+     y="578"
+     id="text19">table identity</text>
+  <text
+     class="box-sub"
+     x="130"
+     y="602"
+     id="text20">schema id / snapshot id</text>
+  <text
+     class="box-sub"
+     x="130"
+     y="626"
+     id="text21">field id / field type</text>
+  <text
+     class="box-sub"
+     x="130"
+     y="646"
+     id="text22">vector metadata</text>
   <rect
      class="adapter"
-     x="95"
-     y="560"
-     width="310"
-     height="150"
-     id="rect20" />
+     x="500"
+     y="470"
+     width="420"
+     height="180"
+     id="rect22" />
   <text
      class="box-title"
-     x="125"
-     y="588"
-     id="text20">catalog_adapter</text>
+     x="530"
+     y="500"
+     id="text23">type_adapter</text>
   <text
      class="box-sub"
-     x="125"
-     y="615"
-     id="text21">权威元数据入口</text>
+     x="530"
+     y="530"
+     id="text24">TupleDesc + catalog schema → field_id 映射</text>
   <text
-     class="small"
-     x="125"
-     y="641"
-     id="text22">relid / options → table identity</text>
-  <text
-     class="small"
-     x="125"
-     y="664"
-     id="text23">schema id / snapshot id</text>
-  <text
-     class="small"
-     x="125"
-     y="687"
-     id="text24">field_id / field_type / vector metadata</text>
-  <rect
-     class="focus"
-     x="455"
-     y="525"
-     width="430"
-     height="250"
-     id="rect24" />
-  <text
-     class="box-title"
-     x="485"
+     class="box-sub"
+     x="530"
      y="554"
-     id="text25">type_adapter</text>
+     id="text25">Datum / Param → Iceberg predicate value</text>
   <text
      class="box-sub"
-     x="485"
-     y="582"
-     id="text26">重点：openGauss 与 Iceberg 类型/值转换</text>
+     x="530"
+     y="578"
+     id="text26">Arrow batch → Datum / slot values</text>
   <text
-     class="small"
-     x="485"
-     y="610"
-     id="text27">1. TupleDesc + catalog schema → field_id 映射</text>
-  <text
-     class="small"
-     x="485"
-     y="636"
-     id="text28">2. Datum 常量 / Param → Iceberg predicate value</text>
-  <text
-     class="small"
-     x="485"
-     y="662"
-     id="text29">3. Arrow schema 校验；Arrow batch → Datum</text>
-  <text
-     class="small"
-     x="485"
-     y="688"
-     id="text30">4. 产生 exact / recheck / reject 类型策略</text>
-  <line
-     x1="485"
-     y1="710"
-     x2="855"
-     y2="710"
-     stroke="#fdba74"
-     stroke-width="1"
-     id="line30" />
-  <text
-     class="code"
-     x="485"
-     y="735"
-     id="text31">int2/int4/int8 ↔ Iceberg int/long</text>
-  <text
-     class="code"
-     x="485"
-     y="758"
-     id="text32">char/varchar ↔ string；vector(n) ↔ list&lt;float&gt;</text>
+     class="box-sub"
+     x="530"
+     y="602"
+     id="text27">vector dim / float32 / typmod / collation 校验</text>
   <rect
-     class="focus"
-     x="935.62946"
-     y="508.1116"
+     class="adapter"
+     x="990"
+     y="470"
      width="430"
-     height="270"
+     height="180"
+     id="rect27" />
+  <text
+     class="box-title"
+     x="1020"
+     y="500"
+     id="text28">operator_adapter</text>
+  <text
+     class="box-sub"
+     x="1020"
+     y="530"
+     id="text29">识别 OpExpr / NullTest / vector ORDER BY + LIMIT</text>
+  <text
+     class="box-sub"
+     x="1020"
+     y="554"
+     id="text30">标准 predicate：field_id + op + encoded_value</text>
+  <text
+     class="box-sub"
+     x="1020"
+     y="578"
+     id="text31">vector top-k：field_id + metric + query + limit</text>
+  <text
+     class="box-sub"
+     x="1020"
+     y="602"
+     id="text32">划分 remote predicate 与 local recheck qual</text>
+  <rect
+     class="hook"
+     x="1490"
+     y="500"
+     width="210"
+     height="120"
      id="rect32" />
   <text
      class="box-title"
-     x="960"
-     y="554"
-     id="text33">operator_adapter</text>
+     x="1514"
+     y="530"
+     id="text33">sdk_scan_adapter</text>
   <text
      class="box-sub"
-     x="960"
+     x="1514"
+     y="558"
+     id="text34">Iceberg scan request</text>
+  <text
+     class="box-sub"
+     x="1514"
      y="582"
-     id="text34">重点：表达式识别、predicate 标准化、recheck</text>
-  <text
-     class="small"
-     x="960"
-     y="610"
-     id="text35">1. 识别 OpExpr / NullTest / vector ORDER BY + LIMIT</text>
-  <text
-     class="small"
-     x="960"
-     y="636"
-     id="text36">2. 标准 predicate：field_id + op + encoded_value</text>
-  <text
-     class="small"
-     x="960"
-     y="662"
-     id="text37">3. SDK 只接收 Iceberg expression，不接收 OG OID/Expr</text>
-  <text
-     class="small"
-     x="960"
-     y="688"
-     id="text38">4. 划分 remote predicate 与 local recheck qual</text>
-  <line
-     x1="952.25946"
-     y1="708.59265"
-     x2="1322.2595"
-     y2="708.59265"
-     stroke="#fdba74"
-     stroke-width="1"
-     id="line38" />
-  <text
-     class="code"
-     x="948.74103"
-     y="738.51837"
-     id="text39"
-     style="font-style:normal;font-variant:normal;font-weight:600;font-stretch:normal;font-size:14px;line-height:normal;font-family:Consolas, 'Microsoft YaHei', monospace">predicate: standardized Iceberg expression</text>
-  <text
-     class="code"
-     x="948.74109"
-     y="758"
-     id="text40"
-     style="font-style:normal;font-variant:normal;font-weight:600;font-stretch:normal;font-size:14px;line-height:normal;font-family:Consolas, 'Microsoft YaHei', monospace">recheck: exact=false / candidate / collation / bpchar</text>
-  <rect
-     class="scan"
-     x="1420"
-     y="560"
-     width="300"
-     height="150"
-     id="rect40" />
-  <text
-     class="box-title"
-     x="1450"
-     y="588"
-     id="text41">sdk_scan_adapter</text>
+     id="text35">projection / predicate</text>
   <text
      class="box-sub"
-     x="1450"
-     y="615"
-     id="text42">构造全表扫描请求</text>
-  <text
-     class="small"
-     x="1450"
-     y="641"
-     id="text43">projection</text>
-  <text
-     class="small"
-     x="1450"
-     y="664"
-     id="text44">remote predicates</text>
-  <text
-     class="small"
-     x="1450"
-     y="687"
-     id="text45">snapshot / delta options</text>
+     x="1514"
+     y="606"
+     id="text36">snapshot / index_result_ref</text>
   <rect
      class="plan"
-     x="640"
-     y="805"
-     width="540"
-     height="60"
+     x="620"
+     y="675"
+     width="640"
+     height="52"
+     id="rect36" />
+  <text
+     class="box-title"
+     x="646"
+     y="699"
+     id="text37">fdw_private / ForeignScan plan</text>
+  <text
+     class="box-sub"
+     x="646"
+     y="719"
+     id="text38">projection + predicate + recheck qual + snapshot + index_result_ref</text>
+  <rect
+     class="layer"
+     x="56"
+     y="780"
+     width="1688"
+     height="172"
+     id="rect38" />
+  <text
+     class="layer-title"
+     x="80"
+     y="808"
+     id="text39">4. openGauss 扫描整合层</text>
+  <rect
+     class="scan"
+     x="165"
+     y="850"
+     width="390"
+     height="70"
+     id="rect39" />
+  <text
+     class="box-title"
+     x="198"
+     y="878"
+     id="text40">TupleSlot materializer</text>
+  <text
+     class="box-sub"
+     x="198"
+     y="900"
+     id="text41">type_adapter 转换结果 + delta rows/tombstones</text>
+  <rect
+     class="scan"
+     x="1190"
+     y="850"
+     width="360"
+     height="70"
+     id="rect41" />
+  <text
+     class="box-title"
+     x="1224"
+     y="878"
+     id="text42">delta_table_scan</text>
+  <text
+     class="box-sub"
+     x="1224"
+     y="900"
+     id="text43">扫描近期 I/U/D 新鲜数据</text>
+  <rect
+     class="layer"
+     x="56"
+     y="990"
+     width="1688"
+     height="132"
+     id="rect43" />
+  <text
+     class="layer-title"
+     x="80"
+     y="1018"
+     id="text44">5. 外部 SDK / 存储 / openGauss delta 表</text>
+  <rect
+     class="provider"
+     x="110"
+     y="1050"
+     width="310"
+     height="52"
+     id="rect44" />
+  <text
+     class="box-title"
+     x="140"
+     y="1080"
+     id="text45">metadata catalog</text>
+  <rect
+     class="provider"
+     x="500"
+     y="1050"
+     width="330"
+     height="52"
      id="rect45" />
   <text
      class="box-title"
-     x="665"
-     y="831"
-     id="text46">fdw_private / ForeignScan plan</text>
+     x="585.74463"
+     y="1077.8064"
+     id="text46"
+     style="font-style:normal;font-variant:normal;font-weight:700;font-stretch:normal;font-size:19px;line-height:normal;font-family:'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif">Arrow batch</text>
   <text
-     class="small"
-     x="665"
-     y="853"
-     id="text47">projection + predicate + recheck qual + snapshot</text>
-  <path
-     class="line-red"
-     d="M 1138,778 V 805"
-     id="path-operator-recheck-to-fdw-private" />
-  <path
-     class="line-blue"
-     d="M440,410 L440,455 L250,455 L250,550"
-     id="path47" />
-  <path
-     class="line-blue"
-     d="M440,410 L440,455 L670,455 L670,515"
-     id="path48" />
-  <path
-     class="line-blue"
-     d="M440,410 L440,455 L1145,455 L1145,515"
-     id="path49" />
-  <path
-     class="line-blue"
-     d="m 1399.9093,412.11105 v 44.32145 h 171.6958 V 550"
-     id="path50" />
+     class="box-sub"
+     x="584.19019"
+     y="1094.2588"
+     id="text47"
+     style="font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:14px;line-height:normal;font-family:'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif">统一 schema</text>
+  <rect
+     class="provider"
+     x="980"
+     y="1050"
+     width="360"
+     height="52"
+     id="rect47" />
   <text
-     class="small"
-     x="455"
-     y="448"
-     id="text50">planner callbacks 调用内部 adapter</text>
+     class="box-title"
+     x="1012"
+     y="1080"
+     id="text48">Iceberg Java SDK wrapper</text>
   <text
-     class="small"
-     x="1402.4436"
-     y="448.70367"
-     id="text51"
-     style="font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:14px;line-height:normal;font-family:'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif">executor callbacks 调用 scan adapter</text>
+     class="box-sub"
+     x="1012"
+     y="1098"
+     id="text49">metadata / manifest / data file / delete file</text>
+  <rect
+     class="provider"
+     x="1400"
+     y="1050"
+     width="300"
+     height="52"
+     id="rect49" />
+  <text
+     class="box-title"
+     x="1430"
+     y="1080"
+     id="text50">openGauss delta table</text>
+  <text
+     class="box-sub"
+     x="1430"
+     y="1098"
+     id="text51">insert / update / delete 记录</text>
   <path
-     class="line-blue"
-     d="M405,646 L445,646"
+     class="arrow-blue"
+     d="M420,206 L420,300"
      id="path51" />
   <path
-     class="line-amber"
-     d="M885,640 L920,640"
+     class="arrow-blue"
+     d="M1370,206 L1370,300"
      id="path52" />
   <path
-     class="line-red"
-     d="m 884.99336,742.00642 c 22.19548,0 22.19548,15.99133 49.93982,15.99133"
+     class="arrow-blue"
+     d="M440,360 L440,400 L255,400 L255,520"
      id="path53" />
   <path
-     class="line-amber"
-     d="M1360,640 L1410,640"
+     class="arrow-blue"
+     d="M440,360 L440,400 L710,400 L710,470"
      id="path54" />
   <path
-     class="line-blue"
-     d="M670,775 L670,805"
+     class="arrow-blue"
+     d="M710,400 L1205,400 L1205,470"
      id="path55" />
   <path
-     class="line-blue"
-     d="m 1179.9526,834.93772 h 193.508 V 413.712"
-     id="path57" />
-  <text
-     class="small"
-     x="1195"
-     y="823"
-     id="text57">fdw_private 传递到执行期</text>
-  <rect
-     class="band"
-     x="58.592632"
-     y="899.29633"
-     width="1680"
-     height="160"
-     id="rect57" />
-  <text
-     class="band-label"
-     x="85"
-     y="930"
-     id="text58">4. 外部 scan provider 层</text>
-  <rect
-     class="og"
-     x="95"
-     y="970"
-     width="310"
-     height="60"
-     id="rect58" />
-  <text
-     class="box-title"
-     x="125"
-     y="995"
-     id="text59">openGauss TupleSlot</text>
-  <text
-     class="small"
-     x="125"
-     y="1018"
-     id="text60">ExecQual 执行 local recheck</text>
-  <rect
-     class="external"
-     x="470"
-     y="970"
-     width="390"
-     height="60"
-     id="rect60" />
-  <text
-     class="box-title"
-     x="500"
-     y="995"
-     id="text61">Arrow batch</text>
-  <text
-     class="small"
-     x="500"
-     y="1018"
-     id="text62">统一 schema；type_adapter 不感知 base/delta 来源</text>
-  <rect
-     class="external"
-     x="980"
-     y="970"
-     width="350"
-     height="60"
-     id="rect62" />
-  <text
-     class="box-title"
-     x="1010"
-     y="995"
-     id="text63">Iceberg Java SDK wrapper</text>
-  <text
-     class="small"
-     x="1010"
-     y="1018"
-     id="text64">metadata / manifest / data file / delete file</text>
-  <rect
-     class="external"
-     x="1380"
-     y="970"
-     width="340"
-     height="60"
-     id="rect64" />
-  <text
-     class="box-title"
-     x="1410"
-     y="995"
-     id="text65">delta-table scan API</text>
-  <text
-     class="small"
-     x="1410"
-     y="1018"
-     id="text66">预留分支：后续替换 SDK MOR 路径</text>
+     class="arrow-blue"
+     d="M1350,360 L1350,400 L1595,400 L1595,500"
+     id="path56" />
   <path
-     class="line-blue"
-     d="M1570,710 L1570,960"
+     class="arrow-blue"
+     d="M410,585 L500,585"
+     id="path57" />
+  <path
+     class="arrow-orange"
+     d="M920,585 L990,585"
+     id="path58" />
+  <path
+     class="arrow-orange"
+     d="M1420,585 L1490,585"
+     id="path59" />
+  <path
+     class="arrow-blue"
+     d="M710,650 L710,675"
+     id="path60" />
+  <path
+     class="arrow-blue"
+     d="M1205,650 L1205,675"
+     id="path61" />
+  <path
+     class="arrow-blue"
+     d="m 1260,701 270.7798,-1.09683 V 620"
+     id="path62"
+     sodipodi:nodetypes="ccc" />
+  <path
+     class="arrow-blue"
+     d="M1595,620 L1595,760 L1370,760 L1370,850"
+     id="path63" />
+  <path
+     class="arrow-blue"
+     d="m 1700,560 h 20 l 1.0968,453.5476 -561.0968,0 V 1050"
+     id="path64"
+     sodipodi:nodetypes="ccccc" />
+  <path
+     class="arrow-purple"
+     d="M 1520.3856,1047.8063 V 917.80634"
+     id="path65" />
+  <path
+     class="arrow-green"
+     d="M1190,885 L555,885"
      id="path66" />
   <path
-     class="line-blue"
-     d="M1570,710 C1570,880 1155,880 1155,960"
+     class="arrow-green"
+     d="M980,1076 L830,1076"
      id="path67" />
   <path
-     class="line-purple"
-     d="M1570,710 L1550,960"
-     id="path68" />
+     class="arrow-green"
+     d="m 660.61268,1051.0968 c 0.20677,-95.92136 1.59051,-190.92611 2.78492,-289.4944 L 525.19709,761.87661 525.22708,650"
+     id="path68"
+     sodipodi:nodetypes="cccc" />
   <path
-     class="line-green"
-     d="m 1155.0412,970.13946 c 0,-40.33501 -334.3407,-40.33501 -334.3407,-15.12563"
-     id="path69" />
+     class="arrow-green"
+     d="m 500,622 -63.22194,-1.09683 1.09683,217.03171"
+     id="path69"
+     sodipodi:nodetypes="ccc" />
   <path
-     class="line-purple"
-     d="M1550,970 C1550,910 760,910 760,960"
+     class="arrow-red"
+     d="M620,701 L310,701 L310,850"
      id="path70" />
   <path
-     class="line-green"
-     d="M665,970 L665,890 L520,890 L520,780"
-     id="path71" />
+     class="arrow-blue"
+     d="M 165,885 H 75.612682 L 74.515853,181.09683 160,180"
+     id="path71"
+     sodipodi:nodetypes="cccc" />
   <path
-     class="line-green"
-     d="m 454.29631,720.00288 h -34.01483 v 280.67782 h -14.5778"
-     id="path72" />
-  <path
-     class="line-red"
-     d="M640,835 C350,835 250,900 250,960"
-     id="path73" />
-  <text
-     class="small"
-     x="1585"
-     y="845"
-     id="text73">default: delta_scan=off</text>
-  <text
-     class="small"
-     x="1325"
-     y="890"
-     id="text74">reserved: SDK MOR or team delta API</text>
-  <text
-     class="small"
-     x="805"
-     y="925"
-     id="text75">Arrow schema + batch</text>
-  <text
-     class="small"
-     x="526.73999"
-     y="881.51843"
-     id="text76"
-     style="font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:14px;line-height:normal;font-family:'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif">Arrow batch → type_adapter</text>
-  <text
-     class="small"
-     x="305"
-     y="954"
-     id="text77">Datum → slot</text>
-  <text
-     class="small"
-     x="315.03574"
-     y="919.70312"
-     id="text78"
-     style="font-style:normal;font-variant:normal;font-weight:400;font-stretch:normal;font-size:14px;line-height:normal;font-family:'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif">local recheck by original openGauss qual</text>
+     class="arrow-orange"
+     d="M 100.34704,575.4156 61.868038,576.51243 62.964867,1032.1937 265,1030 v 20"
+     id="path72"
+     sodipodi:nodetypes="ccccc" />
   <rect
-     class="band"
-     x="60"
-     y="1100"
-     width="1680"
-     height="155"
-     id="rect78" />
+     class="legend"
+     x="56"
+     y="1148"
+     width="1688"
+     height="100"
+     id="rect72" />
   <text
-     class="note-title"
-     x="85"
-     y="1130"
-     id="text79">predicate 与 recheck 标准</text>
-  <text
-     class="note"
-     x="85"
-     y="1158"
-     id="text80">强下推：类型、操作符、常量编码、collation/比较语义均能证明与 openGauss 等价；例如安全整数映射、白名单比较、IS NULL。</text>
-  <text
-     class="note"
-     x="85"
-     y="1184"
-     id="text81">候选下推 + recheck：能缩小扫描范围但语义可能不完全等价；例如 bpchar 等值、默认 varchar/string、非二进制 collation、近似向量结果。</text>
-  <text
-     class="note"
-     x="85"
-     y="1210"
-     id="text82">不下推：类型收缩、未知操作符、复杂表达式、无法编码常量、语义不可证明；保留为 openGauss local qual。</text>
+     class="layer-title"
+     x="80"
+     y="1174"
+     id="text72">图例与关键语义</text>
   <line
-     x1="1035"
-     y1="1130"
-     x2="1085"
-     y2="1130"
-     class="line-blue"
-     id="line82" />
+     x1="82"
+     y1="1200"
+     x2="122"
+     y2="1200"
+     class="arrow-blue"
+     id="line72" />
   <text
      class="note"
-     x="1097"
-     y="1135"
-     id="text83">控制/规划调用</text>
+     x="136"
+     y="1204"
+     id="text73">控制/规划调用</text>
   <line
-     x1="1220"
-     y1="1130"
+     x1="292"
+     y1="1200"
+     x2="332"
+     y2="1200"
+     class="arrow-orange"
+     id="line73" />
+  <text
+     class="note"
+     x="346"
+     y="1204"
+     id="text74">remote predicate</text>
+  <line
+     x1="512"
+     y1="1200"
+     x2="552"
+     y2="1200"
+     class="arrow-green"
+     id="line74" />
+  <text
+     class="note"
+     x="566"
+     y="1204"
+     id="text75">数据批流转：Arrow batch → type_adapter → TupleSlot materializer</text>
+  <line
+     x1="1000"
+     y1="1200"
+     x2="1040"
+     y2="1200"
+     class="arrow-red"
+     id="line75" />
+  <text
+     class="note"
+     x="1054"
+     y="1204"
+     id="text76">local recheck qual</text>
+  <line
+     x1="1230"
+     y1="1200"
      x2="1270"
-     y2="1130"
-     class="line-amber"
-     id="line83" />
+     y2="1200"
+     class="arrow-purple"
+     id="line76" />
   <text
      class="note"
-     x="1282"
-     y="1135"
-     id="text84">remote predicate</text>
-  <line
-     x1="1220"
-     y1="1170"
-     x2="1270"
-     y2="1170"
-     class="line-red"
-     id="line84" />
+     x="1284"
+     y="1204"
+     id="text77">openGauss delta 表扫描</text>
   <text
      class="note"
-     x="1282"
-     y="1175"
-     id="text85">local recheck qual</text>
-  <line
-     x1="1480"
-     y1="1130"
-     x2="1530"
-     y2="1130"
-     class="line-green"
-     id="line85" />
-  <text
-     class="note"
-     x="1542"
-     y="1135"
-     id="text86">数据批流转</text>
-  <line
-     x1="1480"
-     y1="1170"
-     x2="1530"
-     y2="1170"
-     class="line-purple"
-     id="line86" />
-  <text
-     class="note"
-     x="1542"
-     y="1175"
-     id="text87">delta scan 预留</text>
+     x="80"
+     y="1232"
+     id="text78">强下推要求类型、操作符、常量编码、collation/比较语义均能证明与 openGauss 等价；否则保留 local recheck 或不下推。</text>
 </svg>
