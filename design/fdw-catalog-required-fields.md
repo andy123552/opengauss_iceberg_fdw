@@ -28,4 +28,4 @@
 
 `total_records` 是普通扫描路径的唯一必需行数统计。若当前 snapshot 没有 `total_records`，FDW 不读取 metadata.json 兜底，改用固定默认行数。
 
-`table_uuid` 当前不建议删除：它已经是 `table_schemas`、`snapshots`、`partition_specs` 等 catalog 子表的关联键，并且对应 Iceberg `metadata.json.table-uuid`，比 `relid`、`namespace/table_name` 更适合作为跨 rename、rebind 和索引元数据的一致性身份。只有在实现确认所有子表都改用 `relid` 或 `(namespace, table_name)` 作为关联键，且不需要对齐 Iceberg 原生 table uuid、外部索引表身份和 external catalog 兼容视图时，才可以删除；否则删除会让 schema/snapshot/index 关联退化为本地 relation 绑定，后续 schema evolution 和索引可见性校验更难做。
+`table_uuid` ：是 `table_schemas`、`snapshots`、`partition_specs` 等 catalog 子表的关联键，并且对应 Iceberg `metadata.json.table-uuid`，比 `relid`、`namespace/table_name` 更适合作为跨 rename、rebind 和索引元数据的一致性身份。如果后续实现确认所有子表都改用 `relid` 或 `(namespace, table_name)` 作为关联键，且不需要对齐 Iceberg 原生 table uuid、外部索引表身份和 external catalog 兼容视图时，则可以替换`table_uuid`。
