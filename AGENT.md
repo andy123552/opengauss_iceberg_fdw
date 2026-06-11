@@ -10,6 +10,8 @@
 - 需要实现索引扫描和 DML 写入能力。
 - 元数据管理、索引底层结构、索引扫描底层接口、delta 表写入接口均由团队提供。
 - 本项目主要实现 openGauss FDW 侧规划、执行、DML、事务和类型转换流程。
+- 当前主实现方向是 managed Iceberg foreign table：Iceberg metadata 通过 openGauss 外表 DDL 创建和演进。
+- 后续扫描演进需要考虑在执行期按团队索引接口选择索引扫描；向量 top-k 路径可由上层 vector search 包装，并在 openGauss 本地做精筛。
 
 ## 工作原则
 
@@ -36,4 +38,5 @@
 2. 确认或修复 Docker 方式的本地 openGauss 运行环境。
 3. 等待团队接口定义后补齐接口适配设计。
 4. 实现最小 Iceberg FDW extension 骨架。
-5. 分阶段接入索引扫描和 delta DML 写入。
+5. 优先接入 managed 外表 DDL hook 与基础全表扫描。
+6. 分阶段接入索引扫描、vector search 精筛和 delta DML 写入。

@@ -14,6 +14,12 @@ interface constraints, and follow existing openGauss FDW code patterns first.
   and delta-table write APIs are expected to be provided by the team.
 - This project should implement the openGauss FDW-side planning, execution, DML,
   transaction, option validation, and type conversion flow.
+- Current primary implementation direction is managed Iceberg foreign tables:
+  Iceberg metadata is created and evolved through openGauss foreign-table DDL.
+- Future scan evolution should consider choosing an index-backed scan during
+  execution when the team index APIs are available. Vector top-k paths may be
+  wrapped by an upper vector-search/refine step that performs local exact
+  refinement in openGauss.
 
 ## Local Layout
 
@@ -69,5 +75,7 @@ interface constraints, and follow existing openGauss FDW code patterns first.
 3. Record team-provided Iceberg metadata, index scan, and delta write APIs when
    available.
 4. Implement a minimal Iceberg FDW extension skeleton.
-5. Add index scan planning/execution integration.
+5. Add managed foreign-table DDL hooks and full-scan execution first.
 6. Add DML callbacks and transaction integration for delta writes.
+7. Add index-backed scan and vector-search/refine integration after the basic
+   managed full-scan path is stable.
