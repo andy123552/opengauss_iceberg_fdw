@@ -1,10 +1,10 @@
 #include "postgres.h"
 
-#include "access/reloptions.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
+#include "commands/explain.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -20,8 +20,12 @@
 
 PG_MODULE_MAGIC;
 
+extern List *untransformRelOptions(Datum options);
+
 extern "C" Datum iceberg_fdw_handler(PG_FUNCTION_ARGS);
 extern "C" Datum iceberg_fdw_validator(PG_FUNCTION_ARGS);
+extern "C" void _PG_init(void);
+extern "C" void _PG_fini(void);
 
 PG_FUNCTION_INFO_V1(iceberg_fdw_handler);
 PG_FUNCTION_INFO_V1(iceberg_fdw_validator);
@@ -77,6 +81,18 @@ icebergIsValidOption(const char *keyword, Oid context)
     }
 
     return false;
+}
+
+extern "C" void
+_PG_init(void)
+{
+    iceberg_ddl_init();
+}
+
+extern "C" void
+_PG_fini(void)
+{
+    iceberg_ddl_fini();
 }
 
 static void
@@ -147,6 +163,8 @@ iceberg_fdw_validator(PG_FUNCTION_ARGS)
     List *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
     Oid catalog = PG_GETARG_OID(1);
     ListCell *cell;
+    bool has_namespace = false;
+    bool has_table_name = false;
 
     foreach (cell, options_list) {
         DefElem *def = (DefElem *)lfirst(cell);
@@ -155,6 +173,28 @@ iceberg_fdw_validator(PG_FUNCTION_ARGS)
             ereport(ERROR,
                 (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
                     errmsg("invalid option \"%s\" for iceberg_fdw", def->defname)));
+        }
+
+        if (catalog == ForeignTableRelationId) {
+            if (strcmp(def->defname, "namespace") == 0) {
+                has_namespace = true;
+            } else if (strcmp(def->defname, "table_name") == 0) {
+                has_table_name = true;
+            }
+        }
+    }
+
+    if (catalog == ForeignTableRelationId) {
+        if (!has_namespace) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+                    errmsg("required option \"namespace\" is missing for iceberg_fdw managed foreign table")));
+        }
+
+        if (!has_table_name) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+                    errmsg("required option \"table_name\" is missing for iceberg_fdw managed foreign table")));
         }
     }
 
@@ -178,8 +218,8 @@ icebergGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
     Cost startup_cost = 0;
     Cost total_cost = baserel->rows;
 
-    add_path(baserel, (Path *)create_foreignscan_path(root, baserel, baserel->rows,
-        startup_cost, total_cost, NIL, NULL, NIL));
+    add_path(root, baserel, (Path *)create_foreignscan_path(root, baserel,
+        startup_cost, total_cost, NIL, NULL, NULL, NIL));
 }
 
 static ForeignScan *
