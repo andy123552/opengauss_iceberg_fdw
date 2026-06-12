@@ -17,8 +17,6 @@ typedef enum IcebergFdwOptionContext {
 } IcebergFdwOptionContext;
 
 typedef struct IcebergFdwOptions {
-    char *catalog_type;
-    char *catalog_uri;
     char *warehouse;
     char *namespace_name;
     char *table_name;
@@ -49,8 +47,6 @@ typedef struct IcebergFdwColumnMapping {
 
 typedef struct IcebergCatalogCreateTableRequest {
     Oid relid;
-    const char *catalog_type;
-    const char *catalog_uri;
     const char *warehouse;
     const char *namespace_name;
     const char *table_name;

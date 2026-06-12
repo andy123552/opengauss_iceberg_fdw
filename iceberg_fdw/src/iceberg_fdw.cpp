@@ -36,8 +36,6 @@ typedef struct IcebergValidOption {
 } IcebergValidOption;
 
 static const IcebergValidOption valid_options[] = {
-    {"catalog_type", ForeignServerRelationId},
-    {"catalog_uri", ForeignServerRelationId},
     {"warehouse", ForeignServerRelationId},
     {"namespace", ForeignTableRelationId},
     {"table_name", ForeignTableRelationId},
@@ -98,11 +96,7 @@ _PG_fini(void)
 static void
 icebergApplyOption(IcebergFdwOptions *options, DefElem *def)
 {
-    if (strcmp(def->defname, "catalog_type") == 0) {
-        options->catalog_type = defGetString(def);
-    } else if (strcmp(def->defname, "catalog_uri") == 0) {
-        options->catalog_uri = defGetString(def);
-    } else if (strcmp(def->defname, "warehouse") == 0) {
+    if (strcmp(def->defname, "warehouse") == 0) {
         options->warehouse = defGetString(def);
     } else if (strcmp(def->defname, "namespace") == 0) {
         options->namespace_name = defGetString(def);

@@ -28,9 +28,8 @@ The project root defaults to Docker runtime checks. Do not compile the full
 
 ## Managed DDL Usage
 
-The current implementation supports managed Iceberg foreign tables. The DDL
-path writes table metadata into `iceberg_catalog` and expects the catalog
-extension to be available in the database.
+The current implementation supports managed Iceberg foreign tables backed by
+the local `iceberg_catalog` extension.
 
 Create the required extensions:
 
@@ -39,14 +38,12 @@ CREATE EXTENSION IF NOT EXISTS iceberg_catalog;
 CREATE EXTENSION IF NOT EXISTS iceberg_fdw;
 ```
 
-Create a server with the managed-table catalog settings:
+Create a server with the local warehouse root:
 
 ```sql
 CREATE SERVER iceberg_managed_srv
   FOREIGN DATA WRAPPER iceberg_fdw
   OPTIONS (
-    catalog_type 'internal',
-    catalog_uri 'local',
     warehouse 'file:///tmp/iceberg_fdw_demo'
   );
 ```

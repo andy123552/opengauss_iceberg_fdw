@@ -100,11 +100,7 @@ icebergGetRequiredOption(List *options, const char *name)
 static void
 icebergApplyDdlOption(IcebergFdwOptions *options, DefElem *def)
 {
-    if (strcmp(def->defname, "catalog_type") == 0) {
-        options->catalog_type = defGetString(def);
-    } else if (strcmp(def->defname, "catalog_uri") == 0) {
-        options->catalog_uri = defGetString(def);
-    } else if (strcmp(def->defname, "warehouse") == 0) {
+    if (strcmp(def->defname, "warehouse") == 0) {
         options->warehouse = defGetString(def);
     } else if (strcmp(def->defname, "namespace") == 0) {
         options->namespace_name = defGetString(def);
@@ -186,8 +182,6 @@ icebergHandleCreateForeignTable(CreateForeignTableStmt *stmt)
     memset(&request, 0, sizeof(request));
     memset(&result, 0, sizeof(result));
     request.relid = relid;
-    request.catalog_type = options.catalog_type;
-    request.catalog_uri = options.catalog_uri;
     request.warehouse = options.warehouse;
     request.namespace_name = options.namespace_name;
     request.table_name = options.table_name;

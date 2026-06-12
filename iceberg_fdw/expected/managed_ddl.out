@@ -3,8 +3,6 @@ CREATE EXTENSION IF NOT EXISTS iceberg_fdw;
 CREATE SERVER iceberg_managed_srv
 FOREIGN DATA WRAPPER iceberg_fdw
 OPTIONS (
-    catalog_type 'internal',
-    catalog_uri 'local',
     warehouse 'file:///tmp/iceberg_fdw_regress'
 );
 CREATE FOREIGN TABLE managed_orders (
