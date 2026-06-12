@@ -45,6 +45,13 @@
 - `iceberg_catalog.create_table(...)` 目前只是 C 函数骨架：已做必填参数校验并返回占位 JSONB，真实 schema 校验、namespace/table 检查、Iceberg SDK CreateTable、storage 创建、metadata 注册仍是 TODO。
 - 在 TODO 实现前，FDW 侧不要假设 `create_table` 已能创建真实 Iceberg metadata；scan 规划优先直接消费 catalog 元信息表/视图。
 
+## 当前开发原则
+
+- 项目目录中的 `openGauss-server/` 和 `Catalog/` 是开发参考与集成依赖；`iceberg_fdw/` 代码要保持可独立编译，同时接口、hook、catalog 表和行为要能对接这两个仓库。
+- 调试 openGauss 使用本项目 Docker 实例，把开发中的动态库安装/连接到容器内验证；最终接入、预加载和发布方式暂未定。
+- 功能开发采用先写目标测试用例再实现并验证的方式；测试和代码组织参考 `pg_lake/`，但不把 pg_lake 源码纳入本项目。
+- 开发过程中凡是新增 adapter 边界、catalog 写入、事务回调、类型映射规则，都要补充聚焦的 UT 或回归用例看护。
+
 ## 后续优先事项
 
 1. 使用 `openGauss-server/` 作为 FDW callback 和 contrib 实现的代码对比参考。

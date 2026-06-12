@@ -98,6 +98,25 @@ Current implementation boundary:
   reliable integration surface. Do not assume the `create_table` function
   creates real Iceberg metadata until the TODOs are implemented.
 
+## Current Development Principles
+
+- The local `openGauss-server/` and `Catalog/` repositories are development
+  references and integration dependencies. Keep `iceberg_fdw/` independently
+  buildable while aligning headers, hooks, catalog tables, and runtime behavior
+  with those repositories.
+- Runtime debugging should use the Docker openGauss instance from this project.
+  Build/install the development shared library into that instance for testing;
+  the final product packaging and preload strategy are still open.
+- Follow a test-first flow for feature work. Add target SQL/regression or unit
+  tests before implementing behavior, then use them to guard each incremental
+  step.
+- Use `pg_lake/` as an external reference for DDL handling, extension test
+  layout, and error-path coverage, but do not vendor pg_lake code into this
+  project.
+- Add focused unit/regression coverage whenever a development step introduces a
+  new adapter boundary, catalog write, transaction callback, or type-mapping
+  rule.
+
 ## Build Safety
 
 - The previous local source build path caused OOM. Do not retry source
