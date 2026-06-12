@@ -28,6 +28,10 @@ interface constraints, and follow existing openGauss FDW code patterns first.
 - Source reference repository:
   `https://github.com/DataInfraLab/openGauss-server-datainfra`
 - Source clone notes: `design/source-reference.md`
+- Catalog source reference tree: `Catalog/`
+- Catalog source reference repository: `https://github.com/HardingHang/Catalog`
+- Catalog source reference commit:
+  `8ed555bc4db70e7f1fd2ca5b3722e5dc159d1b57`
 - FDW extension skeleton: `iceberg_fdw/`
 - Runtime mode: use the Docker image in `docker-compose.yml`; do not compile
   the openGauss source tree by default.
@@ -51,6 +55,48 @@ interface constraints, and follow existing openGauss FDW code patterns first.
   and idempotency.
 - Preserve unrelated local changes. The source tree may contain generated files
   from previous builds.
+
+## Catalog Module Context
+
+The team Catalog repository is cloned locally at `Catalog/` and is treated as
+an external source reference, not as code to vendor into this repo. Keep it out
+of normal commits.
+
+Confirmed Catalog capabilities from commit
+`8ed555bc4db70e7f1fd2ca5b3722e5dc159d1b57`:
+
+- It is an openGauss extension named `iceberg_catalog`.
+- The SQL extension creates schema `iceberg_catalog`.
+- It defines metadata tables:
+  `namespaces`, `tables_internal`, `table_schemas`, `snapshots`,
+  `partition_specs`, and `tables_external`.
+- It defines compatibility views:
+  `iceberg_catalog.iceberg_tables` and
+  `iceberg_catalog.iceberg_namespace_properties`.
+- `tables_internal` is the FDW-relevant table binding local `relid` to
+  `namespace`, `table_name`, `table_uuid`, `metadata_location`,
+  `table_location`, `current_schema_id`, `current_snapshot_id`, and
+  `default_spec_id`.
+- `table_schemas` stores expanded top-level Iceberg schema fields by
+  `table_uuid`, `schema_id`, `field_position`, and stable Iceberg `field_id`.
+- `snapshots` stores snapshot summaries including `snapshot_id`, optional
+  `schema_id`, `manifest_list`, and `total_records`.
+- `partition_specs` stores partition-spec fields; an unpartitioned spec can be
+  represented by `field_position = -1`.
+- `tables_external` and the compatibility views are intended for JDBC Catalog
+  style external records without local relation binding.
+
+Current implementation boundary:
+
+- `iceberg_catalog.create_table(...)` exists as a C-language SQL function, but
+  its C implementation is currently a stub. It validates required arguments and
+  returns a placeholder JSONB response.
+- The C stub contains TODOs for schema validation, namespace/table existence
+  checks, Iceberg SDK `CreateTable`, storage creation, and metadata-table
+  registration.
+- For FDW scan planning today, use the catalog metadata tables/views as the
+  reliable integration surface. Do not assume the `create_table` function
+  creates real Iceberg metadata until the TODOs are implemented.
 
 ## Build Safety
 

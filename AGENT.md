@@ -27,10 +27,23 @@
 - openGauss 源码参考树：`openGauss-server/`
 - openGauss 目标参考仓：`https://github.com/DataInfraLab/openGauss-server-datainfra`
 - 源码仓克隆说明：`design/source-reference.md`
+- Catalog 源码参考树：`Catalog/`
+- Catalog 目标参考仓：`https://github.com/HardingHang/Catalog`
+- Catalog 当前参考提交：`8ed555bc4db70e7f1fd2ca5b3722e5dc159d1b57`
 - FDW 基础代码目录：`iceberg_fdw/`
 - 构建记录：后续记录到 `build-notes.md`
 - 设计记录：后续可新增 `design/` 目录
 - 接口适配记录：后续可新增 `interfaces/` 目录
+
+## Catalog 模块上下文
+
+- `Catalog/` 是团队提供的 openGauss 扩展参考仓，本项目只把它作为外部源码参考，不把完整仓库纳入当前项目提交。
+- 扩展名为 `iceberg_catalog`，安装 SQL 创建 `iceberg_catalog` schema。
+- 当前已提供的元信息表包括：`namespaces`、`tables_internal`、`table_schemas`、`snapshots`、`partition_specs`、`tables_external`。
+- 当前已提供的兼容视图包括：`iceberg_catalog.iceberg_tables`、`iceberg_catalog.iceberg_namespace_properties`。
+- FDW scan 侧最相关的是 `tables_internal`、`table_schemas`、`snapshots`、`partition_specs`：分别提供本地 `relid` 到 Iceberg 表身份/metadata 指针的绑定、字段级 schema、snapshot 摘要、分区 spec。
+- `iceberg_catalog.create_table(...)` 目前只是 C 函数骨架：已做必填参数校验并返回占位 JSONB，真实 schema 校验、namespace/table 检查、Iceberg SDK CreateTable、storage 创建、metadata 注册仍是 TODO。
+- 在 TODO 实现前，FDW 侧不要假设 `create_table` 已能创建真实 Iceberg metadata；scan 规划优先直接消费 catalog 元信息表/视图。
 
 ## 后续优先事项
 
