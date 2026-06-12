@@ -26,29 +26,51 @@ make install PG_CONFIG=/path/to/pg_config
 The project root defaults to Docker runtime checks. Do not compile the full
 `openGauss-server/` source tree unless that is explicitly required.
 
-## SQL Usage
+## Managed DDL Usage
+
+The current implementation supports managed Iceberg foreign tables. The DDL
+path writes table metadata into `iceberg_catalog` and expects the catalog
+extension to be available in the database.
+
+Create the required extensions:
 
 ```sql
-CREATE EXTENSION iceberg_fdw;
+CREATE EXTENSION IF NOT EXISTS iceberg_catalog;
+CREATE EXTENSION IF NOT EXISTS iceberg_fdw;
+```
 
-CREATE SERVER iceberg_srv
+Create a server with the managed-table catalog settings:
+
+```sql
+CREATE SERVER iceberg_managed_srv
   FOREIGN DATA WRAPPER iceberg_fdw
   OPTIONS (
-    catalog_type 'rest',
-    catalog_uri 'http://catalog:8181',
-    warehouse 's3://warehouse'
+    catalog_type 'internal',
+    catalog_uri 'local',
+    warehouse 'file:///tmp/iceberg_fdw_demo'
   );
+```
 
-CREATE FOREIGN TABLE iceberg_table (
-  id bigint,
-  data text
+Create a managed foreign table with `namespace` and `table_name`:
+
+```sql
+CREATE FOREIGN TABLE managed_orders (
+  order_id bigint NOT NULL,
+  user_id integer,
+  status varchar(32),
+  note text
 )
-SERVER iceberg_srv
+SERVER iceberg_managed_srv
 OPTIONS (
-  namespace 'default',
-  table_name 'sample_table'
+  namespace 'demo_ns',
+  table_name 'orders'
 );
 ```
 
-The scan and DML callbacks currently raise feature-not-supported errors until
-the team-provided adapter APIs are linked in.
+The table creation path currently supports `int2`, `int4`, `int8`, `text`,
+`varchar`, `bpchar`, and fixed-dimension `vector(n)` columns. It rejects
+`metadata_location` and `path` options, because the implementation is focused
+on managed tables rather than pre-existing external metadata.
+
+Read path and DML callbacks are still placeholders until the team-provided
+scan and delta write APIs are linked in.
