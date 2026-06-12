@@ -49,7 +49,7 @@ openGauss SQL
             +-- delta_scan_adapter
             |
             v
-        Iceberg SDK scan + openGauss delta table scan
+        Iceberg SDK scan + openGauss delta table check/scan
             |
             v
         TupleTableSlot -> openGauss executor recheck quals
@@ -544,6 +544,11 @@ typedef struct IcebergFdwPredicate {
     IcebergFdwValue value;
     bool sdk_pruning_only;
 } IcebergFdwPredicate;
+
+typedef struct IcebergFdwSdkFilter {
+    List *predicates;        /* IcebergFdwPredicate* */
+    bool pruning_only;       /* 首期恒为 true */
+} IcebergFdwSdkFilter;
 ```
 
 `sdk_pruning_only` 首期恒为 `true`。
@@ -562,7 +567,7 @@ typedef struct IcebergFdwPredicate {
 typedef struct IcebergFdwQualClassification {
     List *sdk_predicates;      /* IcebergFdwPredicate */
     List *local_exprs;         /* Expr，包含全部原始 quals */
-    char *serialized_filter;   /* SDK 可消费表达式 */
+    IcebergFdwSdkFilter *sdk_filter;
 } IcebergFdwQualClassification;
 
 void iceberg_operator_classify_scan_clauses(
@@ -586,7 +591,7 @@ typedef struct IcebergFdwPlanState {
     IcebergCatalogStats stats;
     List *column_mappings;        /* IcebergFdwColumnMapping */
     List *sdk_predicates;         /* IcebergFdwPredicate */
-    char *serialized_sdk_filter;
+    IcebergFdwSdkFilter *sdk_filter;
     double rows_before_filter;
     double rows_after_filter;
     Cost startup_cost;
@@ -638,61 +643,46 @@ icebergGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
 
 ### 7.4 计划节点私有信息
 
-`ForeignScan.fdw_private` 必须是可序列化 `List`。首期建议把复杂结构序列化为 JSON 字符串，避免直接塞 C 指针。
+参考 openGauss 现有 FDW 实现，首期 `ForeignScan.fdw_private` 使用 `List` 传递执行期需要的信息。列表元素可以是 planner 阶段在 `PlannerContext` 中分配的结构指针，生命周期随 plan 管理；执行期只读取这些结构，不在其中保存 reader handle、Arrow buffer 等执行期资源。
 
 ```c
 enum IcebergFdwPrivateIndex {
     IcebergFdwPrivScanEntry = 0,
     IcebergFdwPrivProjection,
-    IcebergFdwPrivSdkFilter,
-    IcebergFdwPrivPlanInfo,
-    IcebergFdwPrivDeltaScan
+    IcebergFdwPrivSdkFilter
 };
 ```
 
-`IcebergFdwPrivScanEntry` JSON：
+`IcebergFdwPrivScanEntry`：
 
-```json
-{
-  "relid": 12345,
-  "table_uuid": "...",
-  "metadata_location": "s3://warehouse/t/metadata/00000.metadata.json",
-  "snapshot_id": 1001,
-  "schema_id": 0
-}
+```c
+typedef struct IcebergFdwScanEntry {
+    Oid relid;
+    char *table_uuid;
+    char *metadata_location;
+    int64 snapshot_id;
+    int schema_id;
+} IcebergFdwScanEntry;
 ```
 
-`IcebergFdwPrivProjection` JSON：
+`IcebergFdwPrivProjection`：
 
-```json
-{
-  "attrs": [
-    {"attnum": 1, "field_id": 1, "field_name": "order_id"},
-    {"attnum": 2, "field_id": 2, "field_name": "user_id"}
-  ]
-}
+```c
+typedef struct IcebergFdwProjectedColumn {
+    AttrNumber attnum;
+    int field_id;
+    char *field_name;
+    Oid pg_type;
+    int32 pg_typmod;
+    IcebergFdwLogicalType logical_type;
+} IcebergFdwProjectedColumn;
 ```
 
-`IcebergFdwPrivSdkFilter` JSON：
+`IcebergFdwPrivProjection` 在 `fdw_private` 中保存为 `List *`，元素为 `IcebergFdwProjectedColumn *`。
 
-```json
-{
-  "predicates": [
-    {"field_id": 2, "op": "eq", "type": "int", "value": 10}
-  ],
-  "pruning_only": true
-}
-```
+`IcebergFdwPrivSdkFilter`：
 
-`IcebergFdwPrivDeltaScan` JSON：
-
-```json
-{
-  "enabled": true,
-  "delta_relation": "iceberg_delta.orders_iceberg_delta",
-  "base_snapshot_id": 1001
-}
-```
+`fdw_private` 中保存 `IcebergFdwSdkFilter *`。该结构只描述 SDK 可用于文件/分区剪枝的 predicate，首期 `pruning_only` 恒为 `true`。
 
 ### 7.5 `GetForeignPlan`
 
@@ -703,7 +693,7 @@ enum IcebergFdwPrivateIndex {
 3. 调用 `operator_adapter` 生成 SDK pruning filter。
 4. 根据 `tlist` 和 local quals 计算需要读取的列。
 5. 用 `field_id` 生成投影信息。
-6. 构造 `fdw_private`。
+6. 构造 `fdw_private`，包含 scan entry、projection 和 SDK pruning filter。
 7. 调用 `make_foreignscan`，local quals 传入全部原始 quals。
 
 伪代码：
@@ -725,7 +715,7 @@ icebergGetForeignPlan(...)
 
     List *fdw_private = iceberg_build_fdw_private(fdw_state,
                                                   retrieved_attrs,
-                                                  quals.serialized_filter);
+                                                  quals.sdk_filter);
 
     return make_foreignscan(tlist,
                             local_exprs,
@@ -746,23 +736,22 @@ typedef struct IcebergFdwScanState {
     Oid relid;
     TupleDesc tuple_desc;
 
-    IcebergCatalogTableInfo table_info;
+    IcebergFdwScanEntry *scan_entry;
     int64 snapshot_id;
     int schema_id;
 
-    List *column_mappings;
-    List *projected_attrs;
+    List *projected_columns;        /* IcebergFdwProjectedColumn* */
     int *projected_field_ids;
     int n_projected_fields;
 
-    char *sdk_filter_json;
+    IcebergFdwSdkFilter *sdk_filter;
     IcebergSdkScan *iceberg_scan;
     ArrowArray *current_array;
     ArrowSchema *current_schema;
     int current_row;
     int current_batch_rows;
 
-    bool delta_scan_enabled;
+    bool delta_scan_enabled;       /* 执行期确认存在 delta 表后置 true */
     DeltaScanHandle *delta_scan;
     bool reading_delta;
 
@@ -777,13 +766,12 @@ typedef struct IcebergFdwScanState {
 
 1. 解析 `fdw_private`。
 2. 打开 relation，读取 `TupleDesc`。
-3. 调用 `iceberg_catalog_get_table_info(relid)`。
-4. 校验 `table_uuid` 与计划一致。
-5. 加载当前 schema 字段并重建 column mappings。
-6. 构造 SDK scan request。
-7. 调用 `sdk_scan_adapter` 打开 Iceberg scan。
-8. 如果 delta scan enabled，初始化 `delta_scan_adapter`。
-9. 创建 batch memory context。
+3. 从 `IcebergFdwScanEntry`、projection 和 SDK filter 构造 SDK scan request。
+4. 调用 `sdk_scan_adapter` 打开 Iceberg scan。
+5. 调用 `delta_scan_adapter` 在 openGauss 侧判断是否存在对应 delta 表；存在则初始化 delta scan handle。
+6. 创建 batch memory context。
+
+`BeginForeignScan` 不再重新查询 catalog 元数据。执行期所需的 `metadata_location`、`snapshot_id`、`schema_id`、投影列和 SDK filter 均由 `GetForeignPlan` 通过 `fdw_private` 传入。若后续需要处理计划缓存失效或 schema 演进并发问题，应通过 catalog invalidation 或重新规划解决，而不是在 `BeginForeignScan` 中重新修正计划。
 
 SDK scan request：
 
@@ -794,7 +782,7 @@ typedef struct IcebergSdkScanRequest {
     int schema_id;
     const int *projected_field_ids;
     int n_projected_fields;
-    const char *filter_json;
+    const IcebergFdwSdkFilter *filter;
     bool filter_is_pruning_only;
     bool enable_mor;
 } IcebergSdkScanRequest;
@@ -849,12 +837,12 @@ icebergIterateForeignScan(ForeignScanState *node)
 
 ### 7.9 `ReScanForeignScan`
 
-首期简单关闭并重新打开 SDK scan：
+首期简单关闭并重新打开 SDK scan 与 delta scan：
 
 1. `iceberg_sdk_scan_close`。
 2. `delta_scan_close`。
 3. 清理 batch context。
-4. 使用保存的 request 重新执行 `BeginForeignScan` 初始化逻辑。
+4. 使用执行期状态中保存的 scan entry 和 projection 重新打开扫描句柄。
 
 ### 7.10 `EndForeignScan`
 
@@ -877,7 +865,7 @@ icebergIterateForeignScan(ForeignScanState *node)
 | `Iceberg Snapshot` | `1001` |
 | `Iceberg Schema ID` | `0` |
 | `Projection Field IDs` | `1,2,3` |
-| `SDK Filter` | JSON 摘要 |
+| `SDK Filter` | pruning predicate 摘要 |
 | `Filter Mode` | `pruning only, local recheck required` |
 | `Delta Scan` | `enabled` / `disabled` |
 | `MOR Support` | `false` |
@@ -928,13 +916,20 @@ void iceberg_sdk_scan_close(IcebergSdkScan *scan);
 
 delta 表是 openGauss 表，用于记录尚未更新到 Iceberg metadata 的新鲜 IUD 数据。它不是 Iceberg MOR delete file，也不是 Iceberg metadata 中的 delete file。
 
-查询时需要预留：
+因此 delta 扫描不需要读取 Iceberg metadata 或 Iceberg data file，也不需要走 SDK。FDW 在 base Iceberg scan 之外，只需要预留一个 openGauss 侧 delta 表判断和扫描入口。
+
+查询时的完整语义后续应演进为：
 
 ```text
 final result = Iceberg base snapshot scan overlay visible delta IUD rows
 ```
 
-也就是说，后续完整实现不能只是简单追加 delta insert 行，还需要根据 delta 表中的 update/delete 记录对 base snapshot 行做可见性覆盖。首期可以只定义接口，不实际合并复杂 IUD 语义；但扫描流程中必须预留 delta scan 阶段。
+后续完整实现不能只是简单追加 delta insert 行，还需要根据 delta 表中的 update/delete 记录对 base snapshot 行做可见性覆盖。首期本文只要求在 `IterateForeignScan` 中预留接口：
+
+1. 执行期判断目标外表是否存在对应 delta 表。
+2. 如果存在，打开 openGauss delta 表 scan。
+3. Iceberg base scan EOF 后，从 delta scan 返回可见行。
+4. 复杂 IUD 覆盖、去重、删除遮蔽规则由后续 delta 表方案定义。
 
 ### 9.2 接口
 
@@ -949,10 +944,11 @@ typedef struct DeltaScanRequest {
     Snapshot og_snapshot;
 } DeltaScanRequest;
 
-bool iceberg_delta_scan_available(Oid base_relid);
+Oid iceberg_delta_lookup_relation(Oid base_relid);
 
 DeltaScanHandle *iceberg_delta_scan_begin(
     MemoryContext cxt,
+    Oid delta_relid,
     const DeltaScanRequest *request);
 
 bool iceberg_delta_scan_next(
@@ -965,14 +961,7 @@ void iceberg_delta_scan_end(DeltaScanHandle *handle);
 
 ### 9.3 预留字段
 
-`ForeignScan.fdw_private` 中的 `IcebergFdwPrivDeltaScan` 记录：
-
-- 是否启用 delta scan。
-- delta relation 标识。
-- base snapshot id。
-- 投影列。
-
-实际 delta 表设计和 IUD 合并规则由后续 DML 方案补充。
+delta scan 不需要通过 `fdw_private` 传递计划项。执行期已经有 `relid`、`snapshot_id`、投影列和 openGauss snapshot，`BeginForeignScan` 可直接调用 `iceberg_delta_lookup_relation(relid)` 判断是否存在对应 delta 表；不存在则跳过 delta 阶段。实际 delta 表设计和 IUD 合并规则由后续 DML 方案补充。
 
 ## 10. 当前约束与错误策略
 
@@ -985,7 +974,7 @@ void iceberg_delta_scan_end(DeltaScanHandle *handle);
 
 ### 10.2 扫描约束
 
-- 只支持全表扫描路径。
+- 本文只展开基础全表扫描路径。
 - 不做 LIMIT pushdown。
 - 不做 ORDER BY pushdown。
 - SDK filter 只剪枝，所有 filter 都本地 recheck。
