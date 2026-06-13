@@ -15,10 +15,10 @@
 首期明确不支持：
 
 - 不支持连接已有外部 Iceberg metadata 文件的 read-only external table。
-- 不支持 MOR，不处理 Iceberg delete file 的读时合并语义。
 - 不支持 `ANALYZE`。
 - 不支持绕过 openGauss 外表 DDL 修改 Iceberg metadata。
-- SDK 层只做 Iceberg 文件/分区剪枝和列裁剪；所有 SQL filter 在 openGauss 侧必须 recheck。
+- 首期 FDW 不自行实现 Iceberg delete file/MOR 合并逻辑；Rust SDK `to_arrow()` 路径默认应用 position/equality delete。
+- SDK 层使用 iceberg-rust Arrow 列式扫描接口，投影参数传顶层列名，谓词参数由桥接层转换为 iceberg-rust `Predicate`。
 
 ## 2. 总体架构
 
@@ -52,7 +52,7 @@ openGauss SQL
         Iceberg SDK scan + openGauss delta table check/scan
             |
             v
-        TupleTableSlot -> openGauss executor recheck quals
+        TupleTableSlot -> openGauss executor optional local quals
 ```
 
 核心原则：
@@ -61,7 +61,7 @@ openGauss SQL
 - Iceberg metadata 是底层数据湖表的权威元数据。
 - `catalog_adapter` 负责在两者之间维护绑定关系。
 - 查询阶段信任由 DDL 创建出的列定义，不重复执行外部表兼容性校验。
-- 查询阶段仍必须按 `field_id` 访问 Iceberg 数据，不能只依赖列顺序。
+- 查询阶段调用 Rust SDK 时按当前顶层列名传递投影和谓词字段；SDK 内部再把列名解析为 Iceberg field id。
 
 ## 3. DDL 能力实现
 
@@ -371,7 +371,7 @@ bool iceberg_catalog_get_snapshot_stats(
     IcebergCatalogStats *out);
 ```
 
-### 4.3 field id 映射
+### 4.3 field id 与 SDK 列名
 
 首期不单独建设 `field_id_map` 表。理由：
 
@@ -380,11 +380,17 @@ bool iceberg_catalog_get_snapshot_stats(
 - `table_schemas` 已保存当前 schema 的 `field_name`、`field_position`、`field_id`。
 - `RENAME COLUMN` 同步修改 openGauss attname 与 Iceberg field name，`field_id` 保持不变。
 
-查询期 `type_adapter` 用 `TupleDesc` 的列名在当前 `table_schemas` 中匹配 `field_id`。由于 DDL 受控，该映射被视为可信。
+Iceberg metadata 仍需要 `field_id` 作为 schema evolution 的稳定列身份，catalog 继续维护该字段。但 FDW 调用 Rust SDK 的公开扫描接口时不传 `field_id`，只传当前 schema 顶层列名：
+
+- 投影列：`columns`/`n_columns` 为列名数组。
+- 谓词字段：filter 表达式中的字段名为当前顶层列名。
+- SDK 在 `TableScanBuilder::select(...).build()` 内部按列名解析 field id，并使用 `ProjectionMask` 完成真正的 field id 投影。
+
+因此查询期不再需要构建 `attnum -> field_id` 或独立 `field_id_map` 扫描映射。`type_adapter` 只需要从 `TupleDesc` 和受控 catalog 中拿到列名、openGauss 类型、typmod、collation 与 Iceberg 物理类型，用于构造 SDK 列名请求和 Arrow 转 Datum。
 
 `table_schemas.field_type` 只保存 Iceberg 物理类型，不保存 openGauss 逻辑类型扩展信息。例如 openGauss `vector(n)` 在 Iceberg schema 中记录为 `list<float>`。向量列的“这是 vector 类型”和“维度是多少”由 openGauss 外表列类型 `VECTOROID` 与 typmod 管理，catalog 不再保存 `logical_type`、`vector_dim`、`vector_element_type` 一类字段。
 
-后续如果支持连接外部 Iceberg 表、跨系统 schema evolution、隐藏列或复杂 drop/rename 历史，再增加独立 `field_id_map(relid, attnum, field_id)` 表。
+后续如果支持连接外部 Iceberg 表、跨系统 schema evolution、隐藏列或复杂 drop/rename 历史，再评估是否需要独立 `field_id_map(relid, attnum, field_id)` 表；该表即便存在，也只服务 catalog 一致性和诊断，不作为 Rust SDK open 接口入参。
 
 ## 5. Type Adapter
 
@@ -393,13 +399,13 @@ bool iceberg_catalog_get_snapshot_stats(
 `type_adapter` 负责三类工作：
 
 1. DDL 期：把 openGauss 列类型映射为 Iceberg schema 字段类型。
-2. 规划期：建立 `attnum -> field_id`、`attnum -> pg_type/typmod` 与 Iceberg 物理字段类型的扫描映射。
+2. 规划期：建立 `attnum -> column_name`、`attnum -> pg_type/typmod` 与 Iceberg 物理字段类型的扫描映射。
 3. 执行期：把 Arrow/Iceberg 值转换为 openGauss `Datum`，填入 `TupleTableSlot`。
 
 managed-only 模式下，查询期不再做“openGauss 外表是否兼容外部 Iceberg schema”的完整校验；外表列类型在 DDL 期已经校验并生成 Iceberg metadata，查询期只做轻量一致性检查：
 
 - `relid` 是否存在 internal catalog 记录。
-- 当前 schema 是否能找到所有投影列对应的 `field_id`。
+- 当前 schema 是否能找到所有投影列对应的顶层列名。
 - SDK 返回的 Arrow schema 是否与 scan request 中的投影列数量和基础类型一致。
 
 ### 5.2 类型映射
@@ -446,8 +452,7 @@ managed-only 模式下，查询期不再做“openGauss 外表是否兼容外部
 ```c
 typedef struct IcebergFdwColumnMapping {
     AttrNumber attnum;
-    int field_id;
-    char *field_name;
+    char *column_name;
     Oid pg_type;
     int32 pg_typmod;
     Oid pg_collation;
@@ -456,7 +461,7 @@ typedef struct IcebergFdwColumnMapping {
 } IcebergFdwColumnMapping;
 ```
 
-`IcebergFdwColumnMapping` 不保存 logical type。标量转换和向量转换都从 `pg_type`、`pg_typmod`、`iceberg_field_type` 推导。对 `vector(n)` 而言，`pg_typmod` 保存维度，`iceberg_field_type` 固定为 `list<float>`。
+`IcebergFdwColumnMapping` 不保存 logical type，也不保存 SDK 投影所需的 field id。标量转换和向量转换都从 `pg_type`、`pg_typmod`、`iceberg_field_type` 推导。对 `vector(n)` 而言，`pg_typmod` 保存维度，`iceberg_field_type` 固定为 `list<float>`。
 
 ### 5.4 调用点
 
@@ -464,7 +469,7 @@ typedef struct IcebergFdwColumnMapping {
 | --- | --- |
 | DDL hook create/alter | `iceberg_type_build_iceberg_schema_from_tupledesc`，生成 Iceberg field type |
 | `GetForeignRelSize` | `iceberg_type_build_column_mappings`，构造规划期列映射 |
-| `GetForeignPlan` | 根据投影列生成 `projected_field_ids` |
+| `GetForeignPlan` | 根据投影列生成 `projected_column_names` |
 | `BeginForeignScan` | 初始化 Arrow converter |
 | `IterateForeignScan` | Arrow batch 行转 Datum/slot |
 
@@ -495,25 +500,27 @@ bool iceberg_type_arrow_row_to_slot(
 
 本文只描述基础扫描路径，仍保留 `operator_adapter`，用于：
 
-- 识别可传给 SDK 做文件/分区剪枝的简单谓词。
-- 生成 SDK filter expression。
-- 保留所有原始 qual 作为 openGauss local recheck。
+- 识别可转换为 iceberg-rust `Predicate` 的简单谓词。
+- 生成以当前顶层列名引用字段的 SDK filter expression。
+- 对无法转换为 SDK filter 的谓词保留为 openGauss local qual。
+- 首期也可保留全部原始 qual 作为防御性 recheck，但对已成功转换为 Rust SDK `Predicate` 的顶层标量谓词，正确性不再依赖本地 recheck。
 
 关键约束：
 
-- SDK filter 只用于剪枝，不作为最终正确性依据。
-- `GetForeignPlan` 传给 `make_foreignscan` 的 local quals 必须包含全部原始 `scan_clauses`。
-- 即便谓词被下推给 SDK，扫描返回后仍由 openGauss 执行器 recheck。
+- SDK filter 字段名必须是当前 Iceberg schema 的顶层列名，不传 field id。
+- 桥接层负责把 FDW filter 表达式构造成 iceberg-rust `Predicate`，不是 SQL 字符串直传。
+- Rust SDK 会用 filter 自动完成分区/文件/列统计/row-group 剪枝，并在 Arrow 读取路径执行行级过滤。
+- 为降低初期风险，`GetForeignPlan` 可以继续把全部原始 `scan_clauses` 放入 local quals；后续确认桥接谓词覆盖完整后，可只保留未下推残差。
 
 ### 6.2 谓词下推范围
 
-可尝试下推到 SDK 剪枝：
+可尝试转换为 SDK `Predicate`：
 
-| 类型 | 操作符 | 下推用途 | local recheck |
+| 类型 | 操作符 | SDK 行为 | local recheck |
 | --- | --- | --- | --- |
-| int/long | `=` `<` `<=` `>` `>=` | 文件/分区剪枝 | 必须 |
-| int/long | `IS NULL` / `IS NOT NULL` | 文件/分区剪枝 | 必须 |
-| varchar/text | `=` | 保守剪枝 | 必须 |
+| int/long | `=` `<` `<=` `>` `>=` | 剪枝 + 行级过滤 | 首期可保留防御性 recheck |
+| int/long | `IS NULL` / `IS NOT NULL` | 剪枝 + 行级过滤 | 首期可保留防御性 recheck |
+| varchar/text | `=` | 剪枝 + 行级过滤 | 首期可保留防御性 recheck |
 | bpchar | `=` | 一般不下推，除非语义明确 | 必须 |
 
 不下推：
@@ -538,37 +545,37 @@ typedef enum IcebergFdwOperator {
 } IcebergFdwOperator;
 
 typedef struct IcebergFdwPredicate {
-    int field_id;
+    char *column_name;
     Oid pg_type;
     int32 pg_typmod;
     char *iceberg_field_type;
     IcebergFdwOperator op;
     IcebergFdwValue value;
-    bool sdk_pruning_only;
+    bool exact_in_sdk;
 } IcebergFdwPredicate;
 
 typedef struct IcebergFdwSdkFilter {
     List *predicates;        /* IcebergFdwPredicate* */
-    bool pruning_only;       /* 首期恒为 true */
+    bool exact_in_sdk;       /* rust Predicate 行级过滤成功时为 true */
 } IcebergFdwSdkFilter;
 ```
 
-`sdk_pruning_only` 首期恒为 `true`。
+`exact_in_sdk` 表示该 filter 已成功转换为 iceberg-rust `Predicate`，SDK 会在 Arrow 读取路径做行级精确过滤。首期是否仍把同一 qual 放进 local quals 是 FDW 防御策略，不代表 SDK 只能剪枝。
 
 ### 6.4 调用点
 
 | 函数 | 使用能力 |
 | --- | --- |
 | `GetForeignRelSize` | 可选：估算谓词选择率时识别简单条件 |
-| `GetForeignPlan` | 拆分 SDK pruning predicate 与 local recheck quals |
-| `ExplainForeignScan` | 输出 SDK pruning filter 与 local recheck 数量 |
+| `GetForeignPlan` | 拆分 SDK predicate 与 local residual/recheck quals |
+| `ExplainForeignScan` | 输出 SDK filter 与 local residual/recheck 数量 |
 
 建议接口：
 
 ```c
 typedef struct IcebergFdwQualClassification {
     List *sdk_predicates;      /* IcebergFdwPredicate */
-    List *local_exprs;         /* Expr，包含全部原始 quals */
+    List *local_exprs;         /* Expr，首期可包含全部原始 quals，后续可仅保留残差 */
     IcebergFdwSdkFilter *sdk_filter;
 } IcebergFdwQualClassification;
 
@@ -672,8 +679,7 @@ typedef struct IcebergFdwScanEntry {
 ```c
 typedef struct IcebergFdwProjectedColumn {
     AttrNumber attnum;
-    int field_id;
-    char *field_name;
+    char *column_name;
     Oid pg_type;
     int32 pg_typmod;
     char *iceberg_field_type;
@@ -684,7 +690,7 @@ typedef struct IcebergFdwProjectedColumn {
 
 `IcebergFdwPrivSdkFilter`：
 
-`fdw_private` 中保存 `IcebergFdwSdkFilter *`。该结构只描述 SDK 可用于文件/分区剪枝的 predicate，首期 `pruning_only` 恒为 `true`。
+`fdw_private` 中保存 `IcebergFdwSdkFilter *`。该结构描述可转换为 iceberg-rust `Predicate` 的 filter，字段引用使用当前顶层列名。
 
 ### 7.5 `GetForeignPlan`
 
@@ -692,11 +698,11 @@ typedef struct IcebergFdwProjectedColumn {
 
 1. 从 `baserel->fdw_private` 取 `IcebergFdwPlanState`。
 2. 调用 `extract_actual_clauses(scan_clauses, false)` 得到全部 local exprs。
-3. 调用 `operator_adapter` 生成 SDK pruning filter。
+3. 调用 `operator_adapter` 生成 SDK filter。
 4. 根据 `tlist` 和 local quals 计算需要读取的列。
-5. 用 `field_id` 生成投影信息。
-6. 构造 `fdw_private`，包含 scan entry、projection 和 SDK pruning filter。
-7. 调用 `make_foreignscan`，local quals 传入全部原始 quals。
+5. 用当前顶层列名生成投影信息。
+6. 构造 `fdw_private`，包含 scan entry、projection 和 SDK filter。
+7. 调用 `make_foreignscan`，首期 local quals 可传入全部原始 quals 作为防御性 recheck。
 
 伪代码：
 
@@ -743,8 +749,8 @@ typedef struct IcebergFdwScanState {
     int schema_id;
 
     List *projected_columns;        /* IcebergFdwProjectedColumn* */
-    int *projected_field_ids;
-    int n_projected_fields;
+    const char **projected_column_names;
+    int n_projected_columns;
 
     IcebergFdwSdkFilter *sdk_filter;
     IcebergSdkScan *iceberg_scan;
@@ -773,7 +779,7 @@ typedef struct IcebergFdwScanState {
 5. 调用 `delta_scan_adapter` 在 openGauss 侧判断是否存在对应 delta 表；存在则初始化 delta scan handle。
 6. 创建 batch memory context。
 
-`BeginForeignScan` 不再重新查询 catalog 元数据。执行期所需的 `metadata_location`、`snapshot_id`、`schema_id`、投影列和 SDK filter 均由 `GetForeignPlan` 通过 `fdw_private` 传入。若后续需要处理计划缓存失效或 schema 演进并发问题，应通过 catalog invalidation 或重新规划解决，而不是在 `BeginForeignScan` 中重新修正计划。
+`BeginForeignScan` 不再重新查询 catalog 元数据。执行期所需的 `metadata_location`、`snapshot_id`、`schema_id`、投影列名和 SDK filter 均由 `GetForeignPlan` 通过 `fdw_private` 传入。若后续需要处理计划缓存失效或 schema 演进并发问题，应通过 catalog invalidation 或重新规划解决，而不是在 `BeginForeignScan` 中重新修正计划。
 
 SDK scan request：
 
@@ -782,18 +788,19 @@ typedef struct IcebergSdkScanRequest {
     const char *metadata_location;
     int64 snapshot_id;
     int schema_id;
-    const int *projected_field_ids;
-    int n_projected_fields;
+    const char **columns;
+    int n_columns;
     const IcebergFdwSdkFilter *filter;
-    bool filter_is_pruning_only;
-    bool enable_mor;
+    bool filter_is_exact;
 } IcebergSdkScanRequest;
 ```
 
-首期：
+请求约束：
 
-- `enable_mor=false`。
-- 如果 SDK 发现 Iceberg snapshot 含 delete file，直接报错：`MOR is not supported`。
+- `columns` 只包含当前顶层列名；不传 field id。
+- `filter` 可为空；非空时由桥接层转换为 iceberg-rust `Predicate`。
+- `snapshot_id` 是否传给桥接层取决于 Rust SDK 封装能力；如果封装只支持 metadata path 当前快照，FDW 需要在 catalog commit 时保证 `metadata_location` 指向目标 snapshot 对应的 metadata。
+- Iceberg delete file/MOR 由 Rust SDK `to_arrow()` 路径默认应用，FDW 不自行实现 MOR 合并逻辑。
 
 ### 7.8 `IterateForeignScan`
 
@@ -866,11 +873,11 @@ icebergIterateForeignScan(ForeignScanState *node)
 | `Iceberg Metadata` | `s3://.../metadata.json` |
 | `Iceberg Snapshot` | `1001` |
 | `Iceberg Schema ID` | `0` |
-| `Projection Field IDs` | `1,2,3` |
-| `SDK Filter` | pruning predicate 摘要 |
-| `Filter Mode` | `pruning only, local recheck required` |
+| `Projection Columns` | `order_id,status` |
+| `SDK Filter` | predicate 摘要 |
+| `Filter Mode` | `rust predicate exact; local recheck enabled/disabled` |
 | `Delta Scan` | `enabled` / `disabled` |
-| `MOR Support` | `false` |
+| `MOR Support` | `provided by rust SDK` |
 
 ## 8. SDK Scan Adapter
 
@@ -881,10 +888,11 @@ icebergIterateForeignScan(ForeignScanState *node)
 能力：
 
 - 根据 `metadata_location` 和 `snapshot_id` 打开 Iceberg 表。
-- 按 `field_id` 做列裁剪。
-- 接收 SDK filter，用于 Iceberg 文件/分区剪枝。
+- 按顶层列名做列裁剪，Rust SDK 内部再解析为 field id。
+- 接收 SDK filter，桥接层转换为 iceberg-rust `Predicate`。
+- 依赖 Rust SDK 自动完成分区/文件/列统计/row-group 剪枝和行级过滤。
 - 返回 Arrow batch。
-- 检测 MOR/delete file 并在首期报错。
+- Iceberg delete file/MOR 由 Rust SDK Arrow 读取路径应用；FDW 层只处理 openGauss delta 表叠加。
 
 ### 8.2 接口
 
@@ -908,9 +916,10 @@ void iceberg_sdk_scan_close(IcebergSdkScan *scan);
 ### 8.3 SDK 约束
 
 - SDK 返回的 batch 必须只包含 requested projection。
-- SDK filter 只用于剪枝，不能省略 openGauss recheck。
-- SDK 不负责执行 SQL 语义完整过滤。
-- SDK 发现 delete file/MOR 场景时返回明确错误码。
+- `iceberg_scan_open` 的 projection 参数是 `columns`/`n_columns`，元素为列名字符串，不是 field id。
+- `iceberg_scan_open` 的 filter 参数由桥接层转换为 iceberg-rust `Predicate`，不是 openGauss 表达式树。
+- 已成功转换的 SDK filter 在 Rust Arrow 路径中执行行级过滤；本地 recheck 是首期防御策略或未下推残差处理，不是 Rust SDK 正确性的必要条件。
+- Rust SDK 默认处理 Iceberg position/equality delete；这与 openGauss delta 表不是同一概念。
 
 ## 9. Delta Scan Adapter
 
@@ -979,8 +988,9 @@ delta scan 不需要通过 `fdw_private` 传递计划项。执行期已经有 `r
 - 本文只展开基础全表扫描路径。
 - 不做 LIMIT pushdown。
 - 不做 ORDER BY pushdown。
-- SDK filter 只剪枝，所有 filter 都本地 recheck。
-- 不支持 MOR；检测到 Iceberg delete file 时报错。
+- SDK projection 和 filter 均按顶层列名传入，FDW 不向 Rust SDK 下传 field id。
+- Rust SDK filter 可执行行级精确过滤；首期可保留本地 recheck 作为防御层。
+- Iceberg delete file/MOR 由 Rust SDK Arrow 路径处理；FDW 不自行实现 Iceberg MOR。
 
 ### 10.3 DDL 约束
 
