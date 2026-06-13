@@ -67,7 +67,8 @@ OPTIONS (
 The table creation path currently supports `int2`, `int4`, `int8`, `text`,
 `varchar`, `bpchar`, and fixed-dimension `vector(n)` columns. It rejects
 `metadata_location` and `path` options, because the implementation is focused
-on managed tables rather than pre-existing external metadata.
+on managed tables rather than pre-existing external metadata. Dropping the
+foreign table removes the corresponding rows from `iceberg_catalog`.
 
 Read path and DML callbacks are still placeholders until the team-provided
 scan and delta write APIs are linked in.

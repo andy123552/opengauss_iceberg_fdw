@@ -220,6 +220,7 @@ ORDER BY spec_id, field_position;
 `CREATE FOREIGN TABLE` 仍然需要 `namespace` 和 `table_name`。当前实现支持
 `int2`、`int4`、`int8`、`text`、`varchar`、`bpchar` 和固定维度 `vector(n)`。
 不支持 `metadata_location` 或 `path`，因为这条路径不是外部只读绑定。
+`DROP FOREIGN TABLE` 会同步清理对应的本地 `iceberg_catalog` 记录。
 
 ### 6. 回归 SQL
 

@@ -45,7 +45,7 @@ run_gsql() {
             "su - omm -c 'gsql -d postgres -p 5432 -c \"${sql}\"'"
     else
         docker exec -it "${CONTAINER_NAME}" bash -lc \
-            "su - omm -c 'gsql -d postgres -p 5432'"
+            "su - omm -c 'if command -v rlwrap >/dev/null 2>&1; then exec rlwrap gsql -d postgres -p 5432; else exec gsql -d postgres -p 5432; fi'"
     fi
 }
 

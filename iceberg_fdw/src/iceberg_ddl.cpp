@@ -1,8 +1,9 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
-#include "commands/defrem.h"
+#include "catalog/pg_foreign_table.h"
 #include "foreign/foreign.h"
 #include "nodes/parsenodes.h"
 #include "tcop/utility.h"
@@ -12,6 +13,7 @@
 #include "iceberg_fdw.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
+static bool iceberg_process_utility_installed = false;
 
 static void icebergProcessUtility(processutility_context *processutility_cxt,
     DestReceiver *dest,
@@ -22,26 +24,116 @@ static void icebergProcessUtility(processutility_context *processutility_cxt,
     ProcessUtilityContext context,
     bool isCtas);
 static void icebergXactCallback(XactEvent event, void *arg);
+static void icebergHandleCreateForeignTable(CreateForeignTableStmt *stmt);
+static List *icebergCollectManagedDropServerRelids(DropStmt *stmt);
+
+static void
+icebergEnsureProcessUtilityHook(void)
+{
+    if (ProcessUtility_hook != icebergProcessUtility) {
+        prev_ProcessUtility_hook = ProcessUtility_hook;
+        ProcessUtility_hook = icebergProcessUtility;
+    }
+
+    iceberg_process_utility_installed = true;
+}
 
 static bool
-icebergIsTargetCreateForeignTable(Node *parse_tree)
+icebergIsManagedForeignTable(Oid relid)
 {
+    ForeignTable *table;
     ForeignServer *server;
     ForeignDataWrapper *fdw;
-    CreateForeignTableStmt *stmt;
 
-    if (parse_tree == NULL || !IsA(parse_tree, CreateForeignTableStmt)) {
+    if (!OidIsValid(relid)) {
         return false;
     }
 
-    stmt = (CreateForeignTableStmt *)parse_tree;
-    server = GetForeignServerByName(stmt->servername, true);
+    table = GetForeignTable(relid);
+    if (table == NULL) {
+        return false;
+    }
+
+    server = GetForeignServer(table->serverid);
     if (server == NULL) {
         return false;
     }
 
     fdw = GetForeignDataWrapper(server->fdwid);
-    return strcmp(fdw->fdwname, ICEBERG_FDW_NAME) == 0;
+    return fdw != NULL && strcmp(fdw->fdwname, ICEBERG_FDW_NAME) == 0;
+}
+
+static List *
+icebergCollectManagedDropRelids(DropStmt *stmt)
+{
+    ListCell *lc;
+    List *relids = NIL;
+
+    if (stmt->removeType != OBJECT_FOREIGN_TABLE) {
+        return NIL;
+    }
+
+    foreach (lc, stmt->objects) {
+        RangeVar *relation = makeRangeVarFromNameList((List *)lfirst(lc));
+        Oid relid = RangeVarGetRelid(relation, AccessShareLock, stmt->missing_ok);
+
+        if (OidIsValid(relid) && icebergIsManagedForeignTable(relid)) {
+            relids = lappend_oid(relids, relid);
+        }
+    }
+
+    return relids;
+}
+
+static List *
+icebergCollectManagedDropServerRelids(DropStmt *stmt)
+{
+    ListCell *lc;
+    List *relids = NIL;
+
+    if (stmt->removeType != OBJECT_FOREIGN_SERVER) {
+        return NIL;
+    }
+
+    foreach (lc, stmt->objects) {
+        char *server_name = NameListToString((List *)lfirst(lc));
+        Oid serverid = get_foreign_server_oid(server_name, stmt->missing_ok);
+        Relation rel;
+        SysScanDesc scan;
+        HeapTuple tuple;
+
+        if (!OidIsValid(serverid)) {
+            continue;
+        }
+
+        rel = heap_open(ForeignTableRelationId, AccessShareLock);
+        scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
+
+        while ((tuple = systable_getnext(scan)) != NULL) {
+            Form_pg_foreign_table ft = (Form_pg_foreign_table)GETSTRUCT(tuple);
+
+            if (ft->ftserver == serverid && icebergIsManagedForeignTable(ft->ftrelid)) {
+                relids = lappend_oid(relids, ft->ftrelid);
+            }
+        }
+
+        systable_endscan(scan);
+        heap_close(rel, AccessShareLock);
+    }
+
+    return relids;
+}
+
+static void
+icebergCleanupManagedDropRelids(List *relids)
+{
+    ListCell *lc;
+
+    foreach (lc, relids) {
+        Oid relid = lfirst_oid(lc);
+
+        iceberg_catalog_drop_managed_table(relid);
+    }
 }
 
 static void
@@ -66,6 +158,28 @@ icebergCallParentProcessUtility(processutility_context *processutility_cxt,
             sentToRemote,
 #endif
             completionTag, context, isCtas);
+    }
+}
+
+void
+iceberg_ddl_ensure_hook(void)
+{
+    icebergEnsureProcessUtilityHook();
+}
+
+void
+iceberg_ddl_validate_table_def(Node *obj)
+{
+    if (obj == NULL) {
+        return;
+    }
+
+    switch (nodeTag(obj)) {
+        case T_CreateForeignTableStmt:
+            icebergHandleCreateForeignTable((CreateForeignTableStmt *)obj);
+            break;
+        default:
+            break;
     }
 }
 
@@ -204,14 +318,18 @@ icebergProcessUtility(processutility_context *processutility_cxt,
     bool isCtas)
 {
     Node *parse_tree = processutility_cxt->parse_tree;
-    bool is_iceberg_create = icebergIsTargetCreateForeignTable(parse_tree);
+    bool is_iceberg_drop = false;
+    List *managed_drop_relids = NIL;
 
-    if (is_iceberg_create) {
-        CreateForeignTableStmt *stmt = (CreateForeignTableStmt *)parse_tree;
+    if (parse_tree != NULL && IsA(parse_tree, DropStmt)) {
+        DropStmt *stmt = (DropStmt *)parse_tree;
 
-        icebergRejectExternalPathOptions(stmt->options);
-        icebergGetRequiredOption(stmt->options, "namespace");
-        icebergGetRequiredOption(stmt->options, "table_name");
+        is_iceberg_drop = (stmt->removeType == OBJECT_FOREIGN_TABLE || stmt->removeType == OBJECT_FOREIGN_SERVER);
+        if (stmt->removeType == OBJECT_FOREIGN_TABLE) {
+            managed_drop_relids = icebergCollectManagedDropRelids(stmt);
+        } else if (stmt->removeType == OBJECT_FOREIGN_SERVER) {
+            managed_drop_relids = icebergCollectManagedDropServerRelids(stmt);
+        }
     }
 
     icebergCallParentProcessUtility(processutility_cxt, dest,
@@ -220,9 +338,9 @@ icebergProcessUtility(processutility_context *processutility_cxt,
 #endif
         completionTag, context, isCtas);
 
-    if (is_iceberg_create) {
+    if (is_iceberg_drop && managed_drop_relids != NIL) {
         CommandCounterIncrement();
-        icebergHandleCreateForeignTable((CreateForeignTableStmt *)parse_tree);
+        icebergCleanupManagedDropRelids(managed_drop_relids);
     }
 }
 
@@ -251,14 +369,16 @@ icebergXactCallback(XactEvent event, void *arg)
 void
 iceberg_ddl_init(void)
 {
-    prev_ProcessUtility_hook = ProcessUtility_hook;
-    ProcessUtility_hook = icebergProcessUtility;
+    icebergEnsureProcessUtilityHook();
     RegisterXactCallback(icebergXactCallback, NULL);
 }
 
 void
 iceberg_ddl_fini(void)
 {
-    ProcessUtility_hook = prev_ProcessUtility_hook;
+    if (ProcessUtility_hook == icebergProcessUtility) {
+        ProcessUtility_hook = prev_ProcessUtility_hook;
+    }
     UnregisterXactCallback(icebergXactCallback, NULL);
+    iceberg_process_utility_installed = false;
 }

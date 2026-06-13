@@ -24,14 +24,6 @@ typedef struct IcebergFdwOptions {
     char *enable_index_scan;
 } IcebergFdwOptions;
 
-typedef enum IcebergFdwLogicalType {
-    ICEBERG_FDW_TYPE_INT16,
-    ICEBERG_FDW_TYPE_INT32,
-    ICEBERG_FDW_TYPE_INT64,
-    ICEBERG_FDW_TYPE_STRING,
-    ICEBERG_FDW_TYPE_VECTOR_FLOAT32
-} IcebergFdwLogicalType;
-
 typedef struct IcebergFdwColumnMapping {
     AttrNumber attnum;
     int field_id;
@@ -39,9 +31,7 @@ typedef struct IcebergFdwColumnMapping {
     Oid pg_type;
     int32 pg_typmod;
     Oid pg_collation;
-    IcebergFdwLogicalType logical_type;
     bool nullable;
-    int vector_dim;
     char *iceberg_type;
 } IcebergFdwColumnMapping;
 
@@ -65,11 +55,14 @@ typedef struct IcebergCatalogCreateTableResult {
 extern void icebergGetOptions(Oid foreigntableid, IcebergFdwOptions *options);
 extern void iceberg_ddl_init(void);
 extern void iceberg_ddl_fini(void);
+extern void iceberg_ddl_ensure_hook(void);
+extern void iceberg_ddl_validate_table_def(Node *obj);
 extern List *iceberg_type_build_column_mappings(TupleDesc tuple_desc);
 extern List *iceberg_type_build_column_mappings_from_column_defs(List *column_defs);
 extern bool iceberg_catalog_create_managed_table(
     const IcebergCatalogCreateTableRequest *request,
     IcebergCatalogCreateTableResult *result);
+extern bool iceberg_catalog_drop_managed_table(Oid relid);
 extern void iceberg_metadata_track_create_table(
     Oid relid,
     const IcebergCatalogCreateTableResult *result);

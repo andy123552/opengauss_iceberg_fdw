@@ -3,7 +3,6 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
-#include "commands/defrem.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
@@ -66,6 +65,7 @@ static TupleTableSlot *icebergExecForeignUpdate(EState *estate, ResultRelInfo *r
 static TupleTableSlot *icebergExecForeignDelete(EState *estate, ResultRelInfo *resultRelInfo,
     TupleTableSlot *slot, TupleTableSlot *planSlot);
 static void icebergEndForeignModify(EState *estate, ResultRelInfo *resultRelInfo);
+static void icebergValidateTableDef(Node *obj);
 
 static bool
 icebergIsValidOption(const char *keyword, Oid context)
@@ -132,6 +132,7 @@ iceberg_fdw_handler(PG_FUNCTION_ARGS)
 {
     FdwRoutine *routine = makeNode(FdwRoutine);
 
+    iceberg_ddl_ensure_hook();
     routine->GetForeignRelSize = icebergGetForeignRelSize;
     routine->GetForeignPaths = icebergGetForeignPaths;
     routine->GetForeignPlan = icebergGetForeignPlan;
@@ -147,6 +148,7 @@ iceberg_fdw_handler(PG_FUNCTION_ARGS)
     routine->ExecForeignUpdate = icebergExecForeignUpdate;
     routine->ExecForeignDelete = icebergExecForeignDelete;
     routine->EndForeignModify = icebergEndForeignModify;
+    routine->ValidateTableDef = icebergValidateTableDef;
 
     PG_RETURN_POINTER(routine);
 }
@@ -159,6 +161,8 @@ iceberg_fdw_validator(PG_FUNCTION_ARGS)
     ListCell *cell;
     bool has_namespace = false;
     bool has_table_name = false;
+
+    iceberg_ddl_ensure_hook();
 
     foreach (cell, options_list) {
         DefElem *def = (DefElem *)lfirst(cell);
@@ -193,6 +197,16 @@ iceberg_fdw_validator(PG_FUNCTION_ARGS)
     }
 
     PG_RETURN_VOID();
+}
+
+static void
+icebergValidateTableDef(Node *obj)
+{
+    if (obj == NULL) {
+        return;
+    }
+
+    iceberg_ddl_validate_table_def(obj);
 }
 
 static void

@@ -162,3 +162,39 @@ iceberg_catalog_create_managed_table(const IcebergCatalogCreateTableRequest *req
 
     return true;
 }
+
+bool
+iceberg_catalog_drop_managed_table(Oid relid)
+{
+    int rc;
+    char *sql;
+
+    if (!OidIsValid(relid)) {
+        return false;
+    }
+
+    rc = SPI_connect();
+    if (rc != SPI_OK_CONNECT) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FDW_ERROR),
+                errmsg("iceberg_fdw could not connect to SPI to drop catalog metadata")));
+    }
+
+    PG_TRY();
+    {
+        sql = psprintf(
+            "DELETE FROM iceberg_catalog.tables_internal "
+            "WHERE relid = %u::oid::regclass",
+            relid);
+        icebergSpiExecuteOrError(sql);
+        SPI_finish();
+    }
+    PG_CATCH();
+    {
+        SPI_finish();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    return true;
+}

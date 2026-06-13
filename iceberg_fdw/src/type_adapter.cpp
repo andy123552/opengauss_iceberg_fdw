@@ -13,25 +13,6 @@
 
 #define ICEBERG_FDW_VECTOR_MAX_DIM 16000
 
-static const char *
-icebergLogicalTypeName(IcebergFdwLogicalType type)
-{
-    switch (type) {
-        case ICEBERG_FDW_TYPE_INT16:
-            return "int2";
-        case ICEBERG_FDW_TYPE_INT32:
-            return "int4";
-        case ICEBERG_FDW_TYPE_INT64:
-            return "int8";
-        case ICEBERG_FDW_TYPE_STRING:
-            return "string";
-        case ICEBERG_FDW_TYPE_VECTOR_FLOAT32:
-            return "vector";
-        default:
-            return "unknown";
-    }
-}
-
 static int
 icebergVectorDimFromTypmod(int32 typmod, const char *attname)
 {
@@ -64,31 +45,25 @@ icebergBuildColumnMappingValues(AttrNumber attnum, const char *attname, Oid pg_t
     mapping->pg_typmod = pg_typmod;
     mapping->pg_collation = pg_collation;
     mapping->nullable = nullable;
-    mapping->vector_dim = -1;
 
     switch (pg_type) {
         case INT2OID:
-            mapping->logical_type = ICEBERG_FDW_TYPE_INT16;
             mapping->iceberg_type = pstrdup("int");
             break;
         case INT4OID:
-            mapping->logical_type = ICEBERG_FDW_TYPE_INT32;
             mapping->iceberg_type = pstrdup("int");
             break;
         case INT8OID:
-            mapping->logical_type = ICEBERG_FDW_TYPE_INT64;
             mapping->iceberg_type = pstrdup("long");
             break;
         case TEXTOID:
         case VARCHAROID:
         case BPCHAROID:
-            mapping->logical_type = ICEBERG_FDW_TYPE_STRING;
             mapping->iceberg_type = pstrdup("string");
             break;
         case VECTOROID:
-            mapping->logical_type = ICEBERG_FDW_TYPE_VECTOR_FLOAT32;
-            mapping->vector_dim = icebergVectorDimFromTypmod(pg_typmod, attname);
-            mapping->iceberg_type = psprintf("list<float>;logical=vector;dimension=%d", mapping->vector_dim);
+            (void)icebergVectorDimFromTypmod(pg_typmod, attname);
+            mapping->iceberg_type = pstrdup("list<float>");
             break;
         default:
             ereport(ERROR,
@@ -97,10 +72,6 @@ icebergBuildColumnMappingValues(AttrNumber attnum, const char *attname, Oid pg_t
                         attname, format_type_be(pg_type)),
                     errdetail("Supported DDL types are int2, int4, int8, text, varchar, bpchar, and vector(n).")));
     }
-
-    ereport(DEBUG1,
-        (errmsg("iceberg_fdw mapped column \"%s\" to Iceberg %s",
-            attname, icebergLogicalTypeName(mapping->logical_type))));
 
     return mapping;
 }
