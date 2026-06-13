@@ -106,7 +106,7 @@ cd /home/andy/opengauss_iceberg_fdw
 
 `iceberg_fdw` 的 managed DDL 依赖本地 `Catalog/` 扩展源码和它提供的
 `iceberg_catalog` schema。`Catalog/` 是外部依赖源码，不 vendor 到 FDW
-扩展中。
+扩展中，来源仓库为 [HardingHang/Catalog](https://github.com/HardingHang/Catalog)。
 
 ```bash
 cd /home/andy/opengauss_iceberg_fdw

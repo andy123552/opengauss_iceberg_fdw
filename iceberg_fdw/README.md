@@ -31,6 +31,10 @@ The project root defaults to Docker runtime checks. Do not compile the full
 The current implementation supports managed Iceberg foreign tables backed by
 the local `iceberg_catalog` extension.
 
+`iceberg_catalog` is provided by the external catalog repository:
+[HardingHang/Catalog](https://github.com/HardingHang/Catalog). The catalog
+source is not vendored into this FDW extension.
+
 Create the required extensions:
 
 ```sql
