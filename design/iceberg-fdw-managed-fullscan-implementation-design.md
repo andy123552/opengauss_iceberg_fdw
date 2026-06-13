@@ -349,12 +349,9 @@ typedef struct IcebergCatalogTableInfo {
 typedef struct IcebergCatalogFieldInfo {
     int field_id;
     char *field_name;
-    char *field_type;
+    char *field_type;       /* Iceberg 物理类型，例如 int/long/string/list<float> */
     bool field_required;
     int field_position;
-    char *logical_type;
-    int vector_dim;
-    char *vector_element_type;
 } IcebergCatalogFieldInfo;
 
 typedef struct IcebergCatalogStats {
@@ -385,6 +382,8 @@ bool iceberg_catalog_get_snapshot_stats(
 
 查询期 `type_adapter` 用 `TupleDesc` 的列名在当前 `table_schemas` 中匹配 `field_id`。由于 DDL 受控，该映射被视为可信。
 
+`table_schemas.field_type` 只保存 Iceberg 物理类型，不保存 openGauss 逻辑类型扩展信息。例如 openGauss `vector(n)` 在 Iceberg schema 中记录为 `list<float>`。向量列的“这是 vector 类型”和“维度是多少”由 openGauss 外表列类型 `VECTOROID` 与 typmod 管理，catalog 不再保存 `logical_type`、`vector_dim`、`vector_element_type` 一类字段。
+
 后续如果支持连接外部 Iceberg 表、跨系统 schema evolution、隐藏列或复杂 drop/rename 历史，再增加独立 `field_id_map(relid, attnum, field_id)` 表。
 
 ## 5. Type Adapter
@@ -394,7 +393,7 @@ bool iceberg_catalog_get_snapshot_stats(
 `type_adapter` 负责三类工作：
 
 1. DDL 期：把 openGauss 列类型映射为 Iceberg schema 字段类型。
-2. 规划期：建立 `attnum -> field_id`、`attnum -> logical_type` 的扫描映射。
+2. 规划期：建立 `attnum -> field_id`、`attnum -> pg_type/typmod` 与 Iceberg 物理字段类型的扫描映射。
 3. 执行期：把 Arrow/Iceberg 值转换为 openGauss `Datum`，填入 `TupleTableSlot`。
 
 managed-only 模式下，查询期不再做“openGauss 外表是否兼容外部 Iceberg schema”的完整校验；外表列类型在 DDL 期已经校验并生成 Iceberg metadata，查询期只做轻量一致性检查：
@@ -418,6 +417,14 @@ managed-only 模式下，查询期不再做“openGauss 外表是否兼容外部
 | `char(n)` / `bpchar` | `string` | 允许但谓词保守 | 按 openGauss bpchar 语义构造 Datum |
 | `vector(n)` | `list<float>` | 允许，必须有固定维度 | Arrow `FixedSizeList<Float32>` 或等价结构转 openGauss vector |
 
+向量类型约束：
+
+- 不在 Iceberg 中创建自定义 logical type。
+- 不在 FDW catalog 中保存 `attnum -> logical_type` 或 vector 维度映射。
+- Iceberg schema 只记录 `list<float>` 作为物理存储类型。
+- openGauss 外表列类型 `vector(n)` 是向量语义和维度的权威来源；DDL 期必须要求固定 typmod。
+- 执行期通过 openGauss vector 类型接口构造/解析 Datum，不能依赖 Iceberg catalog 的 logical type 字段。
+
 首期拒绝：
 
 - `boolean`
@@ -437,14 +444,6 @@ managed-only 模式下，查询期不再做“openGauss 外表是否兼容外部
 ### 5.3 数据结构
 
 ```c
-typedef enum IcebergFdwLogicalType {
-    ICEBERG_FDW_TYPE_INT16,
-    ICEBERG_FDW_TYPE_INT32,
-    ICEBERG_FDW_TYPE_INT64,
-    ICEBERG_FDW_TYPE_STRING,
-    ICEBERG_FDW_TYPE_VECTOR_FLOAT32
-} IcebergFdwLogicalType;
-
 typedef struct IcebergFdwColumnMapping {
     AttrNumber attnum;
     int field_id;
@@ -452,11 +451,12 @@ typedef struct IcebergFdwColumnMapping {
     Oid pg_type;
     int32 pg_typmod;
     Oid pg_collation;
-    IcebergFdwLogicalType logical_type;
     bool nullable;
-    int vector_dim;
+    char *iceberg_field_type;    /* Iceberg 物理类型 */
 } IcebergFdwColumnMapping;
 ```
+
+`IcebergFdwColumnMapping` 不保存 logical type。标量转换和向量转换都从 `pg_type`、`pg_typmod`、`iceberg_field_type` 推导。对 `vector(n)` 而言，`pg_typmod` 保存维度，`iceberg_field_type` 固定为 `list<float>`。
 
 ### 5.4 调用点
 
@@ -539,7 +539,9 @@ typedef enum IcebergFdwOperator {
 
 typedef struct IcebergFdwPredicate {
     int field_id;
-    IcebergFdwLogicalType type;
+    Oid pg_type;
+    int32 pg_typmod;
+    char *iceberg_field_type;
     IcebergFdwOperator op;
     IcebergFdwValue value;
     bool sdk_pruning_only;
@@ -674,7 +676,7 @@ typedef struct IcebergFdwProjectedColumn {
     char *field_name;
     Oid pg_type;
     int32 pg_typmod;
-    IcebergFdwLogicalType logical_type;
+    char *iceberg_field_type;
 } IcebergFdwProjectedColumn;
 ```
 
