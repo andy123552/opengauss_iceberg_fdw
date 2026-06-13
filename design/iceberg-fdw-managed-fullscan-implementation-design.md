@@ -126,7 +126,7 @@ void
 _PG_init(void)
 {
     prev_ProcessUtility_hook = ProcessUtility_hook;
-    ProcessUtility_hook = iceberg_ProcessUtility;
+    ProcessUtility_hook = icebergProcessUtility;
     RegisterXactCallback(iceberg_xact_callback, NULL);
 }
 
@@ -146,34 +146,29 @@ _PG_fini(void)
 
 ### 3.3 CREATE FOREIGN TABLE 流程
 
-`iceberg_ProcessUtility` 识别 `CreateForeignTableStmt`，仅处理 server 所属 FDW 为 `iceberg_fdw` 的语句。
+`iceberg_fdw_handler` 返回的 `FdwRoutine` 需要挂接 `ValidateTableDef`，创建 managed 表时由 openGauss `CreateForeignTable` 流程调用该回调。`ProcessUtility` hook 主要用于 `DROP FOREIGN TABLE` 和 `DROP SERVER ... CASCADE` 的 catalog 清理。
 
 流程：
 
-1. 解析 server options：`catalog_type`、`catalog_uri`、`warehouse`。
-2. 解析 table options：`namespace`、`table_name`。
+1. 解析 server option `warehouse`。
+2. 解析 table options `namespace`、`table_name`。
 3. 拒绝外部只读路径相关 option，例如 `metadata_location`、`path`。
 4. 校验 openGauss 列定义是否能映射到 Iceberg 类型。
 5. 计算 Iceberg table location。
-6. 调用 `standard_ProcessUtility` 或前序 hook，创建 openGauss foreign table。
-7. 通过 `RangeVarGetRelid` 获取新建外表 `relid`。
-8. 调用 catalog 模块创建 managed table 记录。
-9. 调用 catalog 模块注册 schema 与 field id。
-10. 记录本事务待提交的 `ICEBERG_METADATA_OP_CREATE_TABLE`。
+6. 调用 `ValidateTableDef` 路径完成 openGauss 外表创建前的校验和 managed table 记录写入。
+8. 记录本事务待提交的 `ICEBERG_METADATA_OP_CREATE_TABLE`。
 
 建议接口：
 
 ```c
 typedef struct IcebergCatalogCreateTableRequest {
     Oid relid;
-    const char *catalog_type;
-    const char *catalog_uri;
     const char *warehouse;
     const char *namespace_name;
     const char *table_name;
     const char *table_location;
     TupleDesc tuple_desc;
-    List *column_defs;
+    List *column_mappings;
 } IcebergCatalogCreateTableRequest;
 
 typedef struct IcebergCatalogCreateTableResult {
@@ -186,12 +181,6 @@ typedef struct IcebergCatalogCreateTableResult {
 bool iceberg_catalog_create_managed_table(
     const IcebergCatalogCreateTableRequest *request,
     IcebergCatalogCreateTableResult *result);
-
-void iceberg_catalog_register_schema_from_tupledesc(
-    Oid relid,
-    const char *table_uuid,
-    int schema_id,
-    TupleDesc tuple_desc);
 
 void iceberg_metadata_track_create_table(
     Oid relid,
@@ -209,7 +198,7 @@ DDL 期类型映射失败必须在 openGauss foreign table 创建前报错。
 | 操作 | 支持 | Iceberg 行为 |
 | --- | --- | --- |
 | `ADD COLUMN` | 是 | 分配新的 `field_id`，生成新 schema |
-| `DROP COLUMN` | 是，建议首期可先禁用 | Iceberg schema 删除字段，保留历史 field id |
+| `DROP COLUMN` | 是，按当前实现支持 | Iceberg schema 删除字段，保留历史 field id |
 | `RENAME COLUMN` | 是 | 保持 `field_id` 不变，更新字段名 |
 | `ALTER COLUMN TYPE` | 仅安全提升 | 生成新 schema，拒绝可能丢精度的修改 |
 | `SET/DROP NOT NULL` | 受限 | 与 Iceberg required/optional 对齐 |
@@ -267,8 +256,8 @@ void iceberg_metadata_track_alter_schema(
 流程：
 
 1. DDL hook 识别 `DropStmt`。
-2. 找出目标 relation 是否为 managed Iceberg foreign table。
-3. 调用原生 `ProcessUtility` 删除 openGauss foreign table。
+2. 找出目标 relation 是否为 managed Iceberg foreign table；`DROP SERVER ... CASCADE` 时先收集受影响的 managed foreign table。
+3. 调用原生 `ProcessUtility` 删除 openGauss foreign table / server。
 4. 调用 catalog 模块删除 internal catalog 绑定记录。
 5. 记录本事务待提交的 drop metadata operation 或 cleanup operation。
 
