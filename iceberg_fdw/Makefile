@@ -1,9 +1,9 @@
 MODULE_big = iceberg_fdw
-OBJS = src/iceberg_fdw.o src/iceberg_ddl.o src/catalog_adapter.o src/type_adapter.o src/metadata_txn.o
+OBJS = src/iceberg_fdw.o src/iceberg_ddl.o src/catalog_adapter.o src/type_adapter.o src/operator_adapter.o src/sdk_scan_adapter.o src/delta_scan_adapter.o src/metadata_txn.o
 
 EXTENSION = iceberg_fdw
 DATA = iceberg_fdw--0.1.0.sql
-REGRESS = managed_ddl
+REGRESS = managed_ddl managed_scan
 
 PG_CPPFLAGS += -I$(srcdir)/include
 CXXFLAGS += -fPIC
