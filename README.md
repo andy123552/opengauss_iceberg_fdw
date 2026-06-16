@@ -1,5 +1,8 @@
 # openGauss Iceberg FDW Project
 
+The implementation checkout lives in the `iceberg_fdw/` git submodule, which
+tracks `https://github.com/DataInfraLab/iceberg_fdw`.
+
 ## Docker 安装 openGauss
 
 本项目默认使用 Docker 镜像运行 openGauss，不再要求在宿主机源码编译安装。

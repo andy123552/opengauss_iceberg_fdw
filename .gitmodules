@@ -1,0 +1,4 @@
+[submodule "iceberg_fdw"]
+	path = iceberg_fdw
+	url = https://github.com/DataInfraLab/iceberg_fdw.git
+	branch = main
