@@ -6,9 +6,16 @@ tracks `https://github.com/DataInfraLab/iceberg_fdw`.
 The scan runtime also depends on the separate bridge project:
 `https://github.com/DataInfraLab/iceberg-rust-bridge`. That bridge is a C ABI
 translation layer only; it does not vendor the Iceberg Rust SDK. Build the
-bridge and the SDK in its own workspace, then point `iceberg_fdw` at the
+bridge and the SDK in their own workspace, then point `iceberg_fdw` at the
 resulting shared library with `ICEBERG_RUST_BRIDGE_SO` or
 `ICEBERG_RUST_BRIDGE_HOME`.
+
+The local openGauss Docker environment is aligned with the
+`https://github.com/DataInfraLab/openGauss-server-datainfra` baseline for
+source-reference and interface compatibility. The container image itself is
+started from `opengauss/opengauss-server:latest`; the DataInfraLab openGauss
+repository is used as the code/reference baseline for the FDW integration work,
+not as a local source build target.
 
 For bridge-side smoke validation, use the dedicated file-based round-trip test
 in that repository. It creates real `file://` metadata and Parquet fixtures in
@@ -117,7 +124,41 @@ cd /home/andy/opengauss_iceberg_fdw
 ./tools/opengauss-docker.sh check
 ```
 
-### 3. 安装并重启
+### 3. 准备 Iceberg Rust SDK 与 bridge
+
+桥接层和 Iceberg Rust SDK 是独立仓库，测试时需要同时准备：
+
+- Iceberg Rust SDK: [apache/iceberg-rust](https://github.com/apache/iceberg-rust)
+- bridge: [DataInfraLab/iceberg-rust-bridge](https://github.com/DataInfraLab/iceberg-rust-bridge)
+
+推荐把两个仓库放在同一个父目录下，供 bridge 的 Cargo path 依赖使用：
+
+```bash
+mkdir -p /tmp/iceberg-stack
+cd /tmp/iceberg-stack
+git clone https://github.com/apache/iceberg-rust.git
+git clone https://github.com/DataInfraLab/iceberg-rust-bridge.git
+
+cd iceberg-rust
+cargo build
+
+cd ../iceberg-rust-bridge
+cargo build
+cargo test --test file_scan_roundtrip file_scan_roundtrip -- --nocapture
+```
+
+`iceberg-rust-bridge` 的文件扫描 smoke 会生成真实的 `file://`
+warehouse、metadata 和 Parquet 文件，随后直接调用 bridge 的
+`table_load` / `scan_open` 读取这些文件。若需要让 `iceberg_fdw`
+在容器里加载这份 bridge，可以把桥库安装到容器内并设置：
+
+```bash
+export ICEBERG_RUST_BRIDGE_SO=/usr/local/opengauss/lib/postgresql/libiceberg_rust_bridge.so
+# 或
+export ICEBERG_RUST_BRIDGE_HOME=/tmp/iceberg-rust-bridge
+```
+
+### 4. 安装并重启
 
 `iceberg_fdw` 的 managed DDL 依赖本地 `Catalog/` 扩展源码和它提供的
 `iceberg_catalog` schema。`Catalog/` 是外部依赖源码，不 vendor 到 FDW
@@ -147,7 +188,7 @@ docker exec opengauss-iceberg-fdw sh -lc '
 '
 ```
 
-### 4. 构建并安装 iceberg_fdw
+### 5. 构建并安装 iceberg_fdw
 
 ```bash
 cd /home/andy/opengauss_iceberg_fdw
@@ -170,7 +211,7 @@ docker exec opengauss-iceberg-fdw sh -lc '
 
 重启是为了让 openGauss 后端重新加载新安装的扩展动态库。
 
-### 5. SQL 配置与建表示例
+### 6. SQL 配置与建表示例
 
 进入 `gsql`：
 
@@ -237,7 +278,71 @@ ORDER BY spec_id, field_position;
 不支持 `metadata_location` 或 `path`，因为这条路径不是外部只读绑定。
 `DROP FOREIGN TABLE` 会同步清理对应的本地 `iceberg_catalog` 记录。
 
-### 6. 回归 SQL
+### 7. 构造测试数据并验证扫描
+
+当前 FDW 的 scan 验证建议按下面顺序执行，保证其他开发者/agent 能复现同一套数据：
+
+1. 准备本地 warehouse 目录
+
+```bash
+docker exec opengauss-iceberg-fdw bash -lc 'mkdir -p /var/lib/opengauss/data/tmp/iceberg_fdw_regress'
+```
+
+2. 使用 bridge 仓库里的 file fixture smoke 生成并验证 Iceberg 数据
+
+```bash
+cd /tmp/iceberg-stack/iceberg-rust-bridge
+cargo test --test file_scan_roundtrip file_scan_roundtrip -- --nocapture
+```
+
+3. 在 openGauss 中创建 managed 表并指向同一目录
+
+```sql
+CREATE EXTENSION IF NOT EXISTS iceberg_catalog;
+CREATE EXTENSION IF NOT EXISTS iceberg_fdw;
+
+CREATE SERVER iceberg_scan_srv
+FOREIGN DATA WRAPPER iceberg_fdw
+OPTIONS (
+    warehouse 'file:///var/lib/opengauss/data/tmp/iceberg_fdw_regress'
+);
+
+CREATE FOREIGN TABLE managed_scan_table (
+    c_smallint smallint,
+    c_integer integer,
+    c_bigint bigint,
+    c_text text,
+    c_varchar varchar(32),
+    c_bpchar char(4),
+    c_vector vector(3)
+)
+SERVER iceberg_scan_srv
+OPTIONS (
+    namespace 'scan_ns',
+    table_name 'scan_table'
+);
+```
+
+4. 验证全表扫描和谓词下推
+
+```sql
+SELECT * FROM managed_scan_table;
+
+SELECT count(*) FROM managed_scan_table WHERE c_integer = 42;
+
+SELECT count(*) FROM managed_scan_table WHERE c_integer = 42 AND c_text = 'iceberg text';
+
+SELECT count(*) FROM managed_scan_table WHERE c_bpchar = 'ABCD';
+```
+
+5. 若要复现 bridge 侧单独验证，直接执行：
+
+```bash
+cd /tmp/iceberg-stack/iceberg-rust-bridge
+cargo test --test file_scan_roundtrip file_scan_roundtrip -- --nocapture
+```
+
+### 8. 回归 SQL
 
 当前镜像缺少 PGXS `pg_regress`，因此 `make installcheck` 不能直接运行。
 可以用 `gsql` 手动执行回归 SQL：
@@ -247,6 +352,7 @@ docker exec opengauss-iceberg-fdw sh -lc '
   su - omm -c "gsql -d postgres -p 5432 -c \"DROP DATABASE IF EXISTS iceberg_fdw_regress;\""
   su - omm -c "gsql -d postgres -p 5432 -c \"CREATE DATABASE iceberg_fdw_regress;\""
   su - omm -c "gsql -d iceberg_fdw_regress -p 5432 -v ON_ERROR_STOP=1 -f /tmp/iceberg_fdw_build/sql/managed_ddl.sql"
+  su - omm -c "gsql -d iceberg_fdw_regress -p 5432 -v ON_ERROR_STOP=1 -f /tmp/iceberg_fdw_build/sql/managed_scan.sql"
 '
 ```
 
