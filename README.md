@@ -3,6 +3,18 @@
 The implementation checkout lives in the `iceberg_fdw/` git submodule, which
 tracks `https://github.com/DataInfraLab/iceberg_fdw`.
 
+The scan runtime also depends on the separate bridge project:
+`https://github.com/DataInfraLab/iceberg-rust-bridge`. That bridge is a C ABI
+translation layer only; it does not vendor the Iceberg Rust SDK. Build the
+bridge and the SDK in its own workspace, then point `iceberg_fdw` at the
+resulting shared library with `ICEBERG_RUST_BRIDGE_SO` or
+`ICEBERG_RUST_BRIDGE_HOME`.
+
+For bridge-side smoke validation, use the dedicated file-based round-trip test
+in that repository. It creates real `file://` metadata and Parquet fixtures in
+a writable local directory, then exercises `table_load` and `scan_open`
+directly against the filesystem backend.
+
 ## Docker 安装 openGauss
 
 本项目默认使用 Docker 镜像运行 openGauss，不再要求在宿主机源码编译安装。
@@ -175,7 +187,7 @@ CREATE EXTENSION IF NOT EXISTS iceberg_fdw;
 CREATE SERVER iceberg_managed_srv
 FOREIGN DATA WRAPPER iceberg_fdw
 OPTIONS (
-    warehouse 'file:///tmp/iceberg_fdw_demo'
+    warehouse 'file:///var/lib/opengauss/data/tmp/iceberg_fdw_demo'
 );
 
 CREATE FOREIGN TABLE managed_orders (

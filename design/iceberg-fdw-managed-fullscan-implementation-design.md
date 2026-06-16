@@ -49,7 +49,7 @@ openGauss SQL
             +-- delta_scan_adapter
             |
             v
-        Iceberg SDK scan + openGauss delta table check/scan
+        bridge loader -> Iceberg Rust SDK batch scan + openGauss delta table check/scan
             |
             v
         TupleTableSlot -> openGauss executor optional local quals
@@ -61,7 +61,7 @@ openGauss SQL
 - Iceberg metadata 是底层数据湖表的权威元数据。
 - `catalog_adapter` 负责在两者之间维护绑定关系。
 - 查询阶段信任由 DDL 创建出的列定义，不重复执行外部表兼容性校验。
-- 查询阶段调用 Rust SDK 时按当前顶层列名传递投影和谓词字段；SDK 内部再把列名解析为 Iceberg field id。
+- 查询阶段调用 Rust SDK 时按当前顶层列名传递投影和谓词字段；FDW 先把扫描参数序列化为 JSON，再由 bridge 转换为 Iceberg Rust SDK 可识别的参数和 `Predicate`。
 
 ## 3. DDL 能力实现
 
@@ -539,7 +539,7 @@ typedef struct IcebergFdwPredicate {
     int32 pg_typmod;
     char *iceberg_field_type;
     IcebergFdwOperator op;
-    IcebergFdwValue value;
+    char *literal_value;
     bool exact_in_sdk;
 } IcebergFdwPredicate;
 
@@ -549,7 +549,7 @@ typedef struct IcebergFdwSdkFilter {
 } IcebergFdwSdkFilter;
 ```
 
-`exact_in_sdk` 表示该 filter 已成功转换为 iceberg-rust `Predicate`，SDK 会在 Arrow 读取路径做行级精确过滤。首期是否仍把同一 qual 放进 local quals 是 FDW 防御策略，不代表 SDK 只能剪枝。
+`exact_in_sdk` 表示该 filter 已成功转换为 bridge 可解析的 iceberg-rust `Predicate` JSON，SDK 会在 Arrow 读取路径做行级精确过滤。首期是否仍把同一 qual 放进 local quals 是 FDW 防御策略，不代表 SDK 只能剪枝。
 
 ### 6.4 调用点
 
@@ -641,57 +641,48 @@ icebergGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
 
 ### 7.4 计划节点私有信息
 
-参考 openGauss 现有 FDW 实现，首期 `ForeignScan.fdw_private` 使用 `List` 传递执行期需要的信息。列表元素可以是 planner 阶段在 `PlannerContext` 中分配的结构指针，生命周期随 plan 管理；执行期只读取这些结构，不在其中保存 reader handle、Arrow buffer 等执行期资源。
+参考 openGauss 现有 FDW 实现，首期 `ForeignScan.fdw_private` 使用 `List` 传递执行期需要的信息。但当前实现不再放入裸 C 结构体指针，而是放入可复制的 `String` 节点，执行期再反序列化回运行态状态。
 
 ```c
 enum IcebergFdwPrivateIndex {
-    IcebergFdwPrivScanEntry = 0,
-    IcebergFdwPrivProjection,
-    IcebergFdwPrivSdkFilter
+    ICEBERG_FDW_PRIVATE_SCAN_OPTIONS_JSON = 0,
+    ICEBERG_FDW_PRIVATE_PREDICATE_COUNT_JSON,
+    ICEBERG_FDW_PRIVATE_FILTER_EXACT_JSON
 };
 ```
 
-`IcebergFdwPrivScanEntry`：
+当前 `fdw_private` 内容与实现一致：
 
 ```c
-typedef struct IcebergFdwScanEntry {
-    Oid relid;
-    char *table_uuid;
-    char *metadata_location;
-    int64 snapshot_id;
-    int schema_id;
-} IcebergFdwScanEntry;
+typedef struct IcebergFdwPrivateStrings {
+    char *scan_options_json;
+    char *predicate_count_json;
+    char *filter_exact_json;
+} IcebergFdwPrivateStrings;
 ```
 
-`IcebergFdwPrivProjection`：
+其中 `scan_options_json` 内部包含：
 
-```c
-typedef struct IcebergFdwProjectedColumn {
-    AttrNumber attnum;
-    char *column_name;
-    Oid pg_type;
-    int32 pg_typmod;
-    char *iceberg_field_type;
-} IcebergFdwProjectedColumn;
-```
+- `projection`
+- `snapshot_id`（若可解析）
+- `batch_size`
+- `case_sensitive`
+- `row_group_filtering_enabled`
+- `row_selection_enabled`
+- `filter`
 
-`IcebergFdwPrivProjection` 在 `fdw_private` 中保存为 `List *`，元素为 `IcebergFdwProjectedColumn *`。
-
-`IcebergFdwPrivSdkFilter`：
-
-`fdw_private` 中保存 `IcebergFdwSdkFilter *`。该结构描述可转换为 iceberg-rust `Predicate` 的 filter，字段引用使用当前顶层列名。
+`filter` 是 bridge 可反序列化的 JSON，字段引用使用当前顶层列名。
 
 ### 7.5 `GetForeignPlan`
 
 流程：
 
 1. 从 `baserel->fdw_private` 取 `IcebergFdwPlanState`。
-2. 调用 `extract_actual_clauses(scan_clauses, false)` 得到全部 local exprs。
-3. 调用 `operator_adapter` 生成 SDK filter。
-4. 根据 `tlist` 和 local quals 计算需要读取的列。
-5. 用当前顶层列名生成投影信息。
-6. 构造 `fdw_private`，包含 scan entry、projection 和 SDK filter。
-7. 调用 `make_foreignscan`，首期 local quals 可传入全部原始 quals 作为防御性 recheck。
+2. 调用 `operator_adapter` 生成 SDK filter。
+3. 根据 `tlist` 和 local quals 计算需要读取的列。
+4. 用当前顶层列名生成投影信息。
+5. 序列化 `scan_options_json`、谓词计数和 exact 标志。
+6. 调用 `make_foreignscan`，首期 local quals 可传入全部原始 quals 作为防御性 recheck。
 
 伪代码：
 
@@ -701,21 +692,20 @@ icebergGetForeignPlan(...)
 {
     IcebergFdwPlanState *fdw_state = baserel->fdw_private;
 
-    List *local_exprs = extract_actual_clauses(scan_clauses, false);
-
     IcebergFdwQualClassification quals;
     iceberg_operator_classify_scan_clauses(root, baserel, scan_clauses,
                                            fdw_state->column_mappings, &quals);
-
-    List *retrieved_attrs = iceberg_build_retrieved_attrs(root, baserel,
-                                                          tlist, local_exprs);
-
-    List *fdw_private = iceberg_build_fdw_private(fdw_state,
-                                                  retrieved_attrs,
-                                                  quals.sdk_filter);
+    char *scan_options_json = icebergSerializeBridgeScanOptionsJson(
+        &fdw_state->options, quals.sdk_filter, icebergBuildProjectedColumns(fdw_state->column_mappings));
+    char *predicate_count_json = psprintf("%d",
+        quals.sdk_filter != NULL ? list_length(quals.sdk_filter->predicates) : 0);
+    char *filter_exact_json = psprintf("%d",
+        (quals.sdk_filter != NULL && quals.sdk_filter->predicates != NIL && quals.sdk_filter->exact_in_sdk) ? 1 : 0);
+    List *fdw_private = list_make3(makeString(scan_options_json), makeString(predicate_count_json),
+        makeString(filter_exact_json));
 
     return make_foreignscan(tlist,
-                            local_exprs,
+                            quals.local_exprs,
                             baserel->relid,
                             NIL,
                             fdw_private,
@@ -733,15 +723,11 @@ typedef struct IcebergFdwScanState {
     Oid relid;
     TupleDesc tuple_desc;
 
-    IcebergFdwScanEntry *scan_entry;
-    int64 snapshot_id;
-    int schema_id;
-
     List *projected_columns;        /* IcebergFdwProjectedColumn* */
-    const char **projected_column_names;
-    int n_projected_columns;
-
-    IcebergFdwSdkFilter *sdk_filter;
+    char *bridge_scan_options_json;
+    char *bridge_storage_config_json;
+    int sdk_predicate_count;
+    bool sdk_filter_exact;
     IcebergSdkScan *iceberg_scan;
     ArrowArray *current_array;
     ArrowSchema *current_schema;
@@ -763,32 +749,33 @@ typedef struct IcebergFdwScanState {
 
 1. 解析 `fdw_private`。
 2. 打开 relation，读取 `TupleDesc`。
-3. 从 `IcebergFdwScanEntry`、projection 和 SDK filter 构造 SDK scan request。
-4. 调用 `sdk_scan_adapter` 打开 Iceberg scan。
-5. 调用 `delta_scan_adapter` 在 openGauss 侧判断是否存在对应 delta 表；存在则初始化 delta scan handle。
-6. 创建 batch memory context。
+3. 读取 `metadata_location`、`table_name`、`table_uuid` 和当前 schema 信息。
+4. 组装 `IcebergSdkScanRequest`，其中包含 `storage_config_json`、`metadata_location`、`table_name`、`scan_options_json` 和投影列名。
+5. 调用 `sdk_scan_adapter` 打开 Iceberg scan。
+6. 调用 `delta_scan_adapter` 在 openGauss 侧判断是否存在对应 delta 表；存在则初始化 delta scan handle。
+7. 创建 scan memory context。
 
-`BeginForeignScan` 不再重新查询 catalog 元数据。执行期所需的 `metadata_location`、`snapshot_id`、`schema_id`、投影列名和 SDK filter 均由 `GetForeignPlan` 通过 `fdw_private` 传入。若后续需要处理计划缓存失效或 schema 演进并发问题，应通过 catalog invalidation 或重新规划解决，而不是在 `BeginForeignScan` 中重新修正计划。
+`BeginForeignScan` 不再重新查询 catalog 元数据。执行期所需的 `metadata_location`、`table_name`、`storage_config_json`、`scan_options_json` 和投影列名均由 `GetForeignPlan` / `icebergGetOptions()` 组合而来。若后续需要处理计划缓存失效或 schema 演进并发问题，应通过 catalog invalidation 或重新规划解决，而不是在 `BeginForeignScan` 中重新修正计划。
 
 SDK scan request：
 
 ```c
 typedef struct IcebergSdkScanRequest {
+    const char *storage_config_json;
     const char *metadata_location;
-    int64 snapshot_id;
-    int schema_id;
-    const char **columns;
-    int n_columns;
-    const IcebergFdwSdkFilter *filter;
-    bool filter_is_exact;
+    const char *table_name;
+    const char *scan_options_json;
+    List *projected_columns;
 } IcebergSdkScanRequest;
 ```
 
 请求约束：
 
-- `columns` 只包含当前顶层列名；不传 field id。
-- `filter` 可为空；非空时由桥接层转换为 iceberg-rust `Predicate`。
-- `snapshot_id` 是否传给桥接层取决于 Rust SDK 封装能力；如果封装只支持 metadata path 当前快照，FDW 需要在 catalog commit 时保证 `metadata_location` 指向目标 snapshot 对应的 metadata。
+- `storage_config_json` 由 FDW 侧构造。当前 file warehouse 使用 `{"storage_scheme":"fs","warehouse":"file://..."}`。
+- `scan_options_json` 由 FDW 侧构造，bridge 负责解析出 projection、filter、batch size 等字段。
+- `projected_columns` 只包含当前顶层列名；不传 field id。
+- `filter` 在 `scan_options_json` 中以 JSON 形式传入，bridge 负责把它反序列化为 iceberg-rust `Predicate`。
+- `snapshot_id` 的传递取决于 bridge 对应能力；当前实现优先通过 `metadata_location` 指向目标快照对应的 metadata。
 - Iceberg delete file/MOR 由 Rust SDK `to_arrow()` 路径默认应用，FDW 不自行实现 MOR 合并逻辑。
 
 ### 7.8 `IterateForeignScan`
@@ -872,26 +859,25 @@ icebergIterateForeignScan(ForeignScanState *node)
 
 ### 8.1 职责
 
-`sdk_scan_adapter` 封装 Iceberg SDK + Arrow C Data Interface。
+`sdk_scan_adapter` 封装 Iceberg Rust bridge + Iceberg SDK + Arrow C Data Interface。
 
 能力：
 
-- 根据 `metadata_location` 和 `snapshot_id` 打开 Iceberg 表。
-- 按顶层列名做列裁剪，Rust SDK 内部再解析为 field id。
-- 接收 SDK filter，桥接层转换为 iceberg-rust `Predicate`。
+- FDW 编译期只依赖一个公共 C ABI 头，例如 `iceberg_bridge_abi.h`，不直接依赖 bridge Rust 内部结构。
+- 运行时通过 `dlopen()` / `dlsym()` 加载 `libiceberg_rust_bridge.so`。
+- 根据 `storage_config_json`、`metadata_location` 和 `table_name` 打开 Iceberg 表。
+- 按顶层列名做列裁剪，bridge 侧再由 Rust SDK 解析为 field id。
+- 接收 `scan_options_json`，由 bridge 将其中的 `filter` JSON 反序列化为 iceberg-rust `Predicate`。
 - 依赖 Rust SDK 自动完成分区/文件/列统计/row-group 剪枝和行级过滤。
-- 返回 Arrow batch。
+- 通过 `scan_next` 按批取回 Arrow 数据，再由 FDW 转成 openGauss `TupleTableSlot`。
 - Iceberg delete file/MOR 由 Rust SDK Arrow 读取路径应用；FDW 层只处理 openGauss delta 表叠加。
 
 ### 8.2 接口
 
 ```c
-typedef struct IcebergSdkScan IcebergSdkScan;
-
 IcebergSdkScan *iceberg_sdk_scan_open(
     MemoryContext cxt,
-    const IcebergSdkScanRequest *request,
-    ArrowSchema **out_schema);
+    const IcebergSdkScanRequest *request);
 
 int iceberg_sdk_scan_next(
     IcebergSdkScan *scan,
@@ -902,11 +888,18 @@ void iceberg_sdk_scan_release_batch(IcebergSdkScan *scan);
 void iceberg_sdk_scan_close(IcebergSdkScan *scan);
 ```
 
+实现边界：
+
+- FDW 不需要在链接期持有 bridge `.so`。
+- 运行时由 `icebergBridgeApi()` 通过 `ICEBERG_RUST_BRIDGE_SO` 或 `ICEBERG_RUST_BRIDGE_HOME` 解析动态库路径。
+- `scan_open` / `scan_next` 走 batch 路径；`scan_next` 返回每一批的数据句柄，FDW 负责把 batch materialize 成 Arrow 数据再转 tuple。
+- 临时的 stream 适配只用于验证或过渡，不作为首期正式方案。
+
 ### 8.3 SDK 约束
 
-- SDK 返回的 batch 必须只包含 requested projection。
-- `iceberg_scan_open` 的 projection 参数是 `columns`/`n_columns`，元素为列名字符串，不是 field id。
-- `iceberg_scan_open` 的 filter 参数由桥接层转换为 iceberg-rust `Predicate`，不是 openGauss 表达式树。
+- bridge 的 `scan_open` 入口只接受 JSON 形式的扫描参数，不接受 SQL 字符串或 openGauss expression tree。
+- `scan_options_json` 里的 `projection` 必须是当前顶层列名数组，不是 field id。
+- `scan_options_json` 里的 `filter` 必须是 bridge 可反序列化的 predicate JSON；当前实现使用 `Binary`、`Unary` 和 `And` 结构。
 - 已成功转换的 SDK filter 在 Rust Arrow 路径中执行行级过滤；本地 recheck 是首期防御策略或未下推残差处理，不是 Rust SDK 正确性的必要条件。
 - Rust SDK 默认处理 Iceberg position/equality delete；这与 openGauss delta 表不是同一概念。
 
@@ -997,8 +990,8 @@ delta scan 不需要通过 `fdw_private` 传递计划项。执行期已经有 `r
 5. 实现 metadata pending operation 跟踪和 `PRE_COMMIT` 提交。
 6. 实现 `GetForeignRelSize` 读取 catalog 摘要和 column mappings。
 7. 实现 `GetForeignPaths` 普通 scan path。
-8. 实现 `GetForeignPlan` 的 projection、SDK filter、local recheck、fdw_private。
-9. 实现 SDK scan adapter 的 open/next/close。
+8. 实现 `GetForeignPlan` 的 projection、JSON scan options、SDK filter、local recheck、fdw_private。
+9. 实现 bridge ABI 头和 SDK scan adapter 的 runtime `dlopen` / `scan_next` batch 读取。
 10. 实现 Arrow 到 slot 的 `type_adapter` 转换。
 11. 预留 delta scan adapter 并接入 `IterateForeignScan` 阶段切换。
 12. 实现 `ALTER FOREIGN TABLE` 的受控 schema evolution。
