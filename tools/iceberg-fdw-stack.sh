@@ -2,16 +2,23 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${COMPOSE_FILE:-${ROOT_DIR}/docker-compose.yml}"
+if [[ -d "${ROOT_DIR}/iceberg_fdw" ]]; then
+    PROJECT_ROOT="${ROOT_DIR}"
+    FDW_DEFAULT_SRC_DIR="${PROJECT_ROOT}/iceberg_fdw"
+else
+    PROJECT_ROOT="$(cd "${ROOT_DIR}/.." && pwd)"
+    FDW_DEFAULT_SRC_DIR="${ROOT_DIR}"
+fi
+COMPOSE_FILE="${COMPOSE_FILE:-${PROJECT_ROOT}/docker-compose.yml}"
 SERVICE_NAME="${SERVICE_NAME:-opengauss}"
 CONTAINER_NAME="${CONTAINER_NAME:-opengauss-iceberg-fdw}"
 PG_CONFIG="${PG_CONFIG:-/usr/local/opengauss/bin/pg_config}"
 REMOTE_WORK_ROOT="${REMOTE_WORK_ROOT:-/tmp/iceberg_fdw_build}"
 HOST_WORK_ROOT="${ICEBERG_FDW_WORK_ROOT:-$(mktemp -d /tmp/iceberg_fdw_build.XXXXXX)}"
-FDW_SRC_DIR="${FDW_SRC_DIR:-${ROOT_DIR}/iceberg_fdw}"
-BRIDGE_SRC_DIR="${BRIDGE_SRC_DIR:-${ROOT_DIR}/iceberg-rust-bridge}"
-CATALOG_SRC_DIR="${CATALOG_SRC_DIR:-${ROOT_DIR}/Catalog}"
-OG_INCLUDE_SRC_DIR="${OG_INCLUDE_SRC_DIR:-${ROOT_DIR}/openGauss-server/src/include}"
+FDW_SRC_DIR="${FDW_SRC_DIR:-${FDW_DEFAULT_SRC_DIR}}"
+BRIDGE_SRC_DIR="${BRIDGE_SRC_DIR:-${PROJECT_ROOT}/iceberg-rust-bridge}"
+CATALOG_SRC_DIR="${CATALOG_SRC_DIR:-${PROJECT_ROOT}/Catalog}"
+OG_INCLUDE_SRC_DIR="${OG_INCLUDE_SRC_DIR:-${PROJECT_ROOT}/openGauss-server/src/include}"
 BRIDGE_SO_IN_CONTAINER="${BRIDGE_SO_IN_CONTAINER:-/usr/local/opengauss/lib/postgresql/libiceberg_rust_bridge.so}"
 
 cleanup() {
@@ -26,8 +33,8 @@ usage() {
 Usage: tools/iceberg-fdw-stack.sh <command>
 
 Commands:
-  setup     Build bridge, Catalog, and iceberg_fdw, then restart the container
   full      Build bridge, Catalog, and iceberg_fdw, then restart the container
+  setup     Build bridge, Catalog, and iceberg_fdw, then restart the container
   bridge    Build bridge and copy libiceberg_rust_bridge.so into the container
   catalog   Build and install Catalog into the container
   fdw       Build and install iceberg_fdw into the container
@@ -173,7 +180,7 @@ build_catalog() {
     docker exec "${CONTAINER_NAME}" sh -lc "
         set -e
         mkdir -p /tmp/ogsrc/src
-        if [[ -d /tmp/openGauss-src-include ]]; then
+        if [ -d /tmp/openGauss-src-include ]; then
             ln -sfn /tmp/openGauss-src-include /tmp/ogsrc/src/include
         fi
         cd '${remote_dir}'
@@ -198,7 +205,7 @@ build_fdw() {
 
     docker exec "${CONTAINER_NAME}" sh -lc "
         set -e
-        if [[ -d /tmp/openGauss-src-include ]]; then
+        if [ -d /tmp/openGauss-src-include ]; then
             mkdir -p /tmp/ogsrc/src
             ln -sfn /tmp/openGauss-src-include /tmp/ogsrc/src/include
         fi
@@ -251,13 +258,13 @@ main() {
     local command="${1:-}"
 
     case "${command}" in
-        setup)
-            require_docker
-            setup_build
-            ;;
         full)
             require_docker
             full_build
+            ;;
+        setup)
+            require_docker
+            setup_build
             ;;
         bridge)
             require_docker
