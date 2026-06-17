@@ -62,6 +62,32 @@ in that repository. It creates real `file://` metadata and Parquet fixtures in
 a writable local directory, then exercises `table_load` and `scan_open`
 directly against the filesystem backend.
 
+## Test Execution
+
+For a full regression run, use the one-click wrapper from the code repository:
+
+```bash
+cd /path/to/opengauss_iceberg_fdw
+./tools/iceberg-fdw-regress.sh
+```
+
+That wrapper boots the openGauss stack, installs the lightweight
+`pg_regress` compatibility harness into the container, runs
+`managed_ddl.sql` and `managed_scan.sql`, and compares the output with the
+checked-in `expected/*.out` files in the code repository.
+
+For the file-based scan fixture and scan regression path, use:
+
+```bash
+cd /path/to/opengauss_iceberg_fdw
+./tools/iceberg-fdw-scan-fixture.sh
+```
+
+That wrapper checks whether the file-based warehouse already exists in the
+container. If it is missing, it rebuilds the fixture with the bridge-side
+`file_scan_roundtrip` test and then runs `managed_scan.sql` against the same
+warehouse.
+
 ## Docker 安装 openGauss
 
 本项目默认使用 Docker 镜像运行 openGauss，不再要求在宿主机源码编译安装。
