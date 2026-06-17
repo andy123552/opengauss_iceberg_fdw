@@ -5,6 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
 CONTAINER_NAME="opengauss-iceberg-fdw"
 SERVICE_NAME="opengauss"
+GSQL_HOST="${GSQL_HOST:-/tmp}"
+if [[ -z "${GSQL_HOST}" || "${GSQL_HOST}" == "Unknown" ]]; then
+    GSQL_HOST="/tmp"
+fi
+GSQL_ENV="env -u PGHOST -u PGPORT -u PGSERVICE -u PGDATABASE -u PGUSER"
+GSQL_BASE="${GSQL_ENV} gsql -h ${GSQL_HOST} -p 5432"
 
 compose() {
     docker compose -f "${COMPOSE_FILE}" "$@"
@@ -42,10 +48,10 @@ run_gsql() {
 
     if [[ -n "${sql}" ]]; then
         docker exec "${CONTAINER_NAME}" bash -lc \
-            "su - omm -c 'gsql -d postgres -p 5432 -c \"${sql}\"'"
+            "su - omm -c '${GSQL_BASE} -d postgres -c \"${sql}\"'"
     else
         docker exec -it "${CONTAINER_NAME}" bash -lc \
-            "su - omm -c 'if command -v rlwrap >/dev/null 2>&1; then exec rlwrap gsql -d postgres -p 5432; else exec gsql -d postgres -p 5432; fi'"
+            "su - omm -c 'if command -v rlwrap >/dev/null 2>&1; then exec rlwrap ${GSQL_BASE} -d postgres; else exec ${GSQL_BASE} -d postgres; fi'"
     fi
 }
 

@@ -25,7 +25,7 @@ inputdir="."
 outputdir="."
 schedule=""
 psqldir="/usr/local/opengauss/bin"
-host="127.0.0.1"
+host="/tmp"
 port="5432"
 
 while [[ $# -gt 0 ]]; do
@@ -109,6 +109,10 @@ if [[ ! -f "${schedule}" ]]; then
     exit 1
 fi
 
+if [[ -z "${host}" || "${host}" == "Unknown" ]]; then
+    host="/tmp"
+fi
+
 results_dir="${outputdir%/}/results"
 mkdir -p "${results_dir}"
 
@@ -136,7 +140,7 @@ sql_exec() {
     local out="$3"
     local sql_escaped
     sql_escaped=$(printf '%q' "${sql}")
-    su - omm -c "bash -lc 'export GAUSSHOME=/usr/local/opengauss; export LD_LIBRARY_PATH=/usr/local/opengauss/lib:\${LD_LIBRARY_PATH}; \"${psqldir}/gsql\" -X -a -q -v ON_ERROR_STOP=1 -p ${port} -d \"${db}\" -f \"${sql_escaped}\"'" >"${out}" 2>&1
+    su - omm -c "bash -lc 'export GAUSSHOME=/usr/local/opengauss; export LD_LIBRARY_PATH=/usr/local/opengauss/lib:\${LD_LIBRARY_PATH}; env -u PGHOST -u PGPORT -u PGSERVICE -u PGDATABASE -u PGUSER \"${psqldir}/gsql\" -X -a -q -v ON_ERROR_STOP=1 -h \"${host}\" -p ${port} -d \"${db}\" -f \"${sql_escaped}\"'" >"${out}" 2>&1
 }
 
 compare_files() {
@@ -164,8 +168,8 @@ for test in "${tests[@]}"; do
         exit 1
     fi
 
-    su - omm -c "bash -lc 'export GAUSSHOME=/usr/local/opengauss; export LD_LIBRARY_PATH=/usr/local/opengauss/lib:\${LD_LIBRARY_PATH}; \"${psqldir}/gsql\" -X -p ${port} -d postgres -c \"DROP DATABASE IF EXISTS \\\"${dbname}\\\";\" >/dev/null 2>&1 || true'"
-    su - omm -c "bash -lc 'export GAUSSHOME=/usr/local/opengauss; export LD_LIBRARY_PATH=/usr/local/opengauss/lib:\${LD_LIBRARY_PATH}; \"${psqldir}/gsql\" -X -p ${port} -d postgres -c \"CREATE DATABASE \\\"${dbname}\\\";\" >/dev/null'"
+    su - omm -c "bash -lc 'export GAUSSHOME=/usr/local/opengauss; export LD_LIBRARY_PATH=/usr/local/opengauss/lib:\${LD_LIBRARY_PATH}; env -u PGHOST -u PGPORT -u PGSERVICE -u PGDATABASE -u PGUSER \"${psqldir}/gsql\" -X -h \"${host}\" -p ${port} -d postgres -c \"DROP DATABASE IF EXISTS \\\"${dbname}\\\";\" >/dev/null 2>&1 || true'"
+    su - omm -c "bash -lc 'export GAUSSHOME=/usr/local/opengauss; export LD_LIBRARY_PATH=/usr/local/opengauss/lib:\${LD_LIBRARY_PATH}; env -u PGHOST -u PGPORT -u PGSERVICE -u PGDATABASE -u PGUSER \"${psqldir}/gsql\" -X -h \"${host}\" -p ${port} -d postgres -c \"CREATE DATABASE \\\"${dbname}\\\";\" >/dev/null'"
 
     if sql_exec "${dbname}" "${sql_file}" "${result_file}"; then
         if compare_files "${expect_file}" "${result_file}"; then

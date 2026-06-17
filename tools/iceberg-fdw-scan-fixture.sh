@@ -7,6 +7,12 @@ BRIDGE_SRC_DIR="${BRIDGE_SRC_DIR:-${ROOT_DIR}/../iceberg-rust-bridge}"
 CONTAINER_NAME="${CONTAINER_NAME:-opengauss-iceberg-fdw}"
 WAREHOUSE_DIR="${WAREHOUSE_DIR:-/var/lib/opengauss/data/tmp/iceberg_fdw_regress}"
 SCAN_DB="${SCAN_DB:-iceberg_fdw_scan}"
+GSQL_HOST="${GSQL_HOST:-/tmp}"
+if [[ -z "${GSQL_HOST}" || "${GSQL_HOST}" == "Unknown" ]]; then
+    GSQL_HOST="/tmp"
+fi
+GSQL_ENV="env -u PGHOST -u PGPORT -u PGSERVICE -u PGDATABASE -u PGUSER"
+GSQL_BASE="${GSQL_ENV} gsql -h ${GSQL_HOST} -p 5432"
 
 require_docker() {
     if ! command -v docker >/dev/null 2>&1; then
@@ -36,9 +42,9 @@ run_validation_sql() {
         set -e
         export GAUSSHOME=/usr/local/opengauss
         export LD_LIBRARY_PATH=/usr/local/opengauss/lib:\$LD_LIBRARY_PATH
-        su - omm -c \"gsql -d postgres -p 5432 -c \\\"DROP DATABASE IF EXISTS ${SCAN_DB};\\\"\" >/dev/null
-        su - omm -c \"gsql -d postgres -p 5432 -c \\\"CREATE DATABASE ${SCAN_DB};\\\"\" >/dev/null
-        su - omm -c \"gsql -d ${SCAN_DB} -p 5432 -v ON_ERROR_STOP=1 -f /tmp/iceberg_fdw_build/sql/managed_scan.sql\"
+        su - omm -c \"${GSQL_BASE} -d postgres -c \\\"DROP DATABASE IF EXISTS ${SCAN_DB};\\\"\" >/dev/null
+        su - omm -c \"${GSQL_BASE} -d postgres -c \\\"CREATE DATABASE ${SCAN_DB};\\\"\" >/dev/null
+        su - omm -c \"${GSQL_BASE} -d ${SCAN_DB} -v ON_ERROR_STOP=1 -f /tmp/iceberg_fdw_build/sql/managed_scan.sql\"
     "
 }
 

@@ -6,6 +6,10 @@ STACK_SCRIPT="${ROOT_DIR}/tools/iceberg-fdw-stack.sh"
 CONTAINER_NAME="${CONTAINER_NAME:-opengauss-iceberg-fdw}"
 REGRESS_BIN_IN_CONTAINER="${REGRESS_BIN_IN_CONTAINER:-/usr/local/opengauss/bin/pg_regress}"
 REMOTE_WORK_ROOT="${REMOTE_WORK_ROOT:-/tmp/iceberg_fdw_build}"
+GSQL_HOST="${GSQL_HOST:-/tmp}"
+if [[ -z "${GSQL_HOST}" || "${GSQL_HOST}" == "Unknown" ]]; then
+    GSQL_HOST="/tmp"
+fi
 
 require_docker() {
     if ! command -v docker >/dev/null 2>&1; then
@@ -37,7 +41,7 @@ run_pg_regress() {
           --outputdir='${REMOTE_WORK_ROOT}' \
           --schedule='${REMOTE_WORK_ROOT}/iceberg_fdw.schedule' \
           --psqldir=/usr/local/opengauss/bin \
-          --host=127.0.0.1 \
+          --host='${GSQL_HOST}' \
           --port=5432
     "
 }

@@ -20,6 +20,12 @@ BRIDGE_SRC_DIR="${BRIDGE_SRC_DIR:-${PROJECT_ROOT}/iceberg-rust-bridge}"
 CATALOG_SRC_DIR="${CATALOG_SRC_DIR:-${PROJECT_ROOT}/Catalog}"
 OG_INCLUDE_SRC_DIR="${OG_INCLUDE_SRC_DIR:-${PROJECT_ROOT}/openGauss-server/src/include}"
 BRIDGE_SO_IN_CONTAINER="${BRIDGE_SO_IN_CONTAINER:-/usr/local/opengauss/lib/postgresql/libiceberg_rust_bridge.so}"
+GSQL_HOST="${GSQL_HOST:-/tmp}"
+if [[ -z "${GSQL_HOST}" || "${GSQL_HOST}" == "Unknown" ]]; then
+    GSQL_HOST="/tmp"
+fi
+GSQL_ENV="env -u PGHOST -u PGPORT -u PGSERVICE -u PGDATABASE -u PGUSER"
+GSQL_BASE="${GSQL_ENV} gsql -h ${GSQL_HOST} -p 5432"
 
 cleanup() {
     if [[ -z "${ICEBERG_FDW_WORK_ROOT:-}" ]]; then
@@ -41,6 +47,7 @@ Commands:
   test      Run managed DDL and managed scan SQL in the container
   restart   Restart the openGauss container
   check     Run a gsql version probe
+  doctor    Print Docker, socket, environment, and gsql diagnostics
   gsql      Open an interactive gsql session
 
 Environment overrides:
@@ -53,6 +60,7 @@ Environment overrides:
   ICEBERG_FDW_WORK_ROOT
   REMOTE_WORK_ROOT
   BRIDGE_SO_IN_CONTAINER
+  GSQL_HOST
   GSQL_WAIT_TIMEOUT
 EOF
 }
@@ -93,15 +101,42 @@ ensure_container_running() {
     fi
 }
 
+print_diagnostics() {
+    echo "diagnostics for ${CONTAINER_NAME}" >&2
+    echo "effective GSQL_HOST=${GSQL_HOST}" >&2
+    echo "effective GSQL_BASE=${GSQL_BASE}" >&2
+    echo >&2
+
+    echo "[docker ps]" >&2
+    docker ps -a --filter "name=${CONTAINER_NAME}" \
+        --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}' >&2 || true
+    echo >&2
+
+    echo "[container process and sockets]" >&2
+    docker exec "${CONTAINER_NAME}" bash -lc \
+        "ps -ef | grep -E 'gaussdb|postgres|entrypoint' | grep -v grep; ls -la /tmp/.s.PGSQL.* 2>/dev/null || true" >&2 || true
+    echo >&2
+
+    echo "[omm connection environment]" >&2
+    docker exec "${CONTAINER_NAME}" bash -lc \
+        "su - omm -c 'env | sort | grep -E \"^(PG|GSQL|GAUSS|LD_|PATH|HOME|USER)=\" || true'" >&2 || true
+    echo >&2
+
+    echo "[gsql probe]" >&2
+    docker exec "${CONTAINER_NAME}" bash -lc \
+        "su - omm -c '${GSQL_BASE} -d postgres -At -c \"select 1;\"'" >&2 || true
+    echo >&2
+}
+
 wait_for_gsql() {
     local timeout="${GSQL_WAIT_TIMEOUT:-60}"
     local start="${SECONDS}"
 
     until docker exec "${CONTAINER_NAME}" bash -lc \
-        "su - omm -c 'gsql -d postgres -p 5432 -At -c \"select 1;\" >/dev/null'" >/dev/null 2>&1; do
+        "su - omm -c '${GSQL_BASE} -d postgres -At -c \"select 1;\" >/dev/null'" >/dev/null 2>&1; do
         if (( SECONDS - start >= timeout )); then
             echo "timed out waiting for openGauss gsql connectivity in ${CONTAINER_NAME}" >&2
-            docker ps --filter "name=${CONTAINER_NAME}" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' >&2 || true
+            print_diagnostics
             docker logs --tail 80 "${CONTAINER_NAME}" >&2 || true
             exit 1
         fi
@@ -116,10 +151,10 @@ run_gsql() {
 
     if [[ -n "${sql}" ]]; then
         docker exec "${CONTAINER_NAME}" bash -lc \
-            "su - omm -c 'gsql -d postgres -p 5432 -c \"${sql}\"'"
+            "su - omm -c '${GSQL_BASE} -d postgres -c \"${sql}\"'"
     else
         docker exec -it "${CONTAINER_NAME}" bash -lc \
-            "su - omm -c 'if command -v rlwrap >/dev/null 2>&1; then exec rlwrap gsql -d postgres -p 5432; else exec gsql -d postgres -p 5432; fi'"
+            "su - omm -c 'if command -v rlwrap >/dev/null 2>&1; then exec rlwrap ${GSQL_BASE} -d postgres; else exec ${GSQL_BASE} -d postgres; fi'"
     fi
 }
 
@@ -228,10 +263,10 @@ run_tests() {
     docker exec "${CONTAINER_NAME}" bash -lc 'mkdir -p /var/lib/opengauss/data/tmp/iceberg_fdw_regress'
     docker exec "${CONTAINER_NAME}" sh -lc "
         set -e
-        su - omm -c \"gsql -d postgres -p 5432 -c \\\"DROP DATABASE IF EXISTS iceberg_fdw_regress;\\\"\"
-        su - omm -c \"gsql -d postgres -p 5432 -c \\\"CREATE DATABASE iceberg_fdw_regress;\\\"\"
-        su - omm -c \"gsql -d iceberg_fdw_regress -p 5432 -v ON_ERROR_STOP=1 -f '${REMOTE_WORK_ROOT}/iceberg_fdw/sql/managed_ddl.sql'\"
-        su - omm -c \"gsql -d iceberg_fdw_regress -p 5432 -v ON_ERROR_STOP=1 -f '${REMOTE_WORK_ROOT}/iceberg_fdw/sql/managed_scan.sql'\"
+        su - omm -c \"${GSQL_BASE} -d postgres -c \\\"DROP DATABASE IF EXISTS iceberg_fdw_regress;\\\"\"
+        su - omm -c \"${GSQL_BASE} -d postgres -c \\\"CREATE DATABASE iceberg_fdw_regress;\\\"\"
+        su - omm -c \"${GSQL_BASE} -d iceberg_fdw_regress -v ON_ERROR_STOP=1 -f '${REMOTE_WORK_ROOT}/iceberg_fdw/sql/managed_ddl.sql'\"
+        su - omm -c \"${GSQL_BASE} -d iceberg_fdw_regress -v ON_ERROR_STOP=1 -f '${REMOTE_WORK_ROOT}/iceberg_fdw/sql/managed_scan.sql'\"
     "
 }
 
@@ -298,6 +333,11 @@ main() {
         check)
             require_docker
             run_gsql "select version();"
+            ;;
+        doctor)
+            require_docker
+            ensure_container_running
+            print_diagnostics
             ;;
         gsql)
             require_docker

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKER_TOOL="${ROOT_DIR}/tools/opengauss-docker.sh"
+FDW_STACK_TOOL="${ROOT_DIR}/tools/iceberg-fdw-stack.sh"
 CONTAINER_NAME="opengauss-iceberg-fdw"
 PG_CONFIG="/usr/local/opengauss/bin/pg_config"
 REMOTE_WORK_ROOT="/tmp/iceberg_stack_build"
@@ -32,6 +33,7 @@ Commands:
   up        Start the openGauss container
   restart   Restart the openGauss container
   check     Verify gsql connectivity
+  doctor    Print Docker, socket, environment, and gsql diagnostics
   gsql      Open an interactive gsql session
   status    Show container status
   down      Stop the openGauss container
@@ -73,6 +75,10 @@ require_host_tools() {
 
 run_docker_tool() {
     bash "${DOCKER_TOOL}" "$@"
+}
+
+run_fdw_stack_tool() {
+    bash "${FDW_STACK_TOOL}" "$@"
 }
 
 stage_dir_to_container() {
@@ -168,13 +174,7 @@ restart_container() {
 }
 
 full_build() {
-    run_docker_tool up
-    run_docker_tool check
-    build_and_install_bridge
-    build_and_install_catalog
-    build_and_install_fdw
-    restart_container
-    run_docker_tool check
+    run_fdw_stack_tool setup
 }
 
 main() {
@@ -187,23 +187,20 @@ main() {
             ;;
         bridge)
             require_host_tools
-            run_docker_tool up
-            build_and_install_bridge
-            restart_container
+            run_fdw_stack_tool bridge
             ;;
         catalog)
             require_host_tools
-            run_docker_tool up
-            build_and_install_catalog
-            restart_container
+            run_fdw_stack_tool catalog
             ;;
         fdw)
             require_host_tools
-            run_docker_tool up
-            build_and_install_fdw
-            restart_container
+            run_fdw_stack_tool fdw
             ;;
-        up|restart|check|gsql|status|down)
+        restart|check|gsql|doctor)
+            run_fdw_stack_tool "${command}"
+            ;;
+        up|status|down)
             run_docker_tool "${command}"
             ;;
         -h|--help|help|"")
