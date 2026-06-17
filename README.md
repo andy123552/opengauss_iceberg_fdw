@@ -17,6 +17,18 @@ started from `opengauss/opengauss-server:latest`; the DataInfraLab openGauss
 repository is used as the code/reference baseline for the FDW integration work,
 not as a local source build target.
 
+For repeatable bring-up and rebuilds, use `tools/iceberg-stack.sh`:
+
+- `./tools/iceberg-stack.sh full` builds and installs bridge, Catalog, and
+  `iceberg_fdw`, then restarts the container.
+- `./tools/iceberg-stack.sh bridge` rebuilds the bridge shared library and
+  copies it into the container.
+- `./tools/iceberg-stack.sh catalog` rebuilds and reinstalls the Catalog
+  extension.
+- `./tools/iceberg-stack.sh fdw` rebuilds and reinstalls `iceberg_fdw`.
+- `./tools/iceberg-stack.sh restart` reconnects the container after a module
+  rebuild.
+
 For bridge-side smoke validation, use the dedicated file-based round-trip test
 in that repository. It creates real `file://` metadata and Parquet fixtures in
 a writable local directory, then exercises `table_load` and `scan_open`
