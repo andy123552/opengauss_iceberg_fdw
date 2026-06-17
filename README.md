@@ -17,6 +17,34 @@ started from `opengauss/opengauss-server:latest`; the DataInfraLab openGauss
 repository is used as the code/reference baseline for the FDW integration work,
 not as a local source build target.
 
+## 一键搭建与编译流程
+
+如果你只是想快速把环境拉起来，并完成 Catalog、bridge、`iceberg_fdw`
+的构建安装，直接使用仓库内的脚本：
+
+```bash
+cd /path/to/opengauss_iceberg_fdw
+./tools/iceberg-stack.sh full
+```
+
+脚本会按顺序完成：
+
+1. 启动 openGauss Docker 容器并检查 `gsql` 连通性。
+2. 构建 `iceberg-rust-bridge`，并把 `libiceberg_rust_bridge.so`
+   放入容器。
+3. 构建并安装 `Catalog` 扩展。
+4. 构建并安装 `iceberg_fdw`。
+5. 重启容器，确保新安装的动态库生效。
+
+如果只想重连某一部分，也可以单独执行：
+
+```bash
+./tools/iceberg-stack.sh bridge
+./tools/iceberg-stack.sh catalog
+./tools/iceberg-stack.sh fdw
+./tools/iceberg-stack.sh restart
+```
+
 For repeatable bring-up and rebuilds, use `tools/iceberg-stack.sh`:
 
 - `./tools/iceberg-stack.sh full` builds and installs bridge, Catalog, and
@@ -55,28 +83,28 @@ directly against the filesystem backend.
 ### 一键启动
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 ./tools/opengauss-docker.sh up
 ```
 
 ### 查看状态
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 ./tools/opengauss-docker.sh status
 ```
 
 ### 容器内连接验证
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 ./tools/opengauss-docker.sh check
 ```
 
 ### 进入 gsql
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 ./tools/opengauss-docker.sh gsql
 ```
 
@@ -131,7 +159,7 @@ CREATE EXTENSION IF NOT EXISTS iceberg_catalog;
 ### 2. 启动 Docker openGauss
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 ./tools/opengauss-docker.sh up
 ./tools/opengauss-docker.sh check
 ```
@@ -177,7 +205,7 @@ export ICEBERG_RUST_BRIDGE_HOME=/tmp/iceberg-rust-bridge
 扩展中，来源仓库为 [HardingHang/Catalog](https://github.com/HardingHang/Catalog)。
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 
 rm -rf /tmp/iceberg_catalog_build
 mkdir -p /tmp/iceberg_catalog_build
@@ -203,7 +231,7 @@ docker exec opengauss-iceberg-fdw sh -lc '
 ### 5. 构建并安装 iceberg_fdw
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 
 rm -rf /tmp/iceberg_fdw_build
 mkdir -p /tmp/iceberg_fdw_build
@@ -228,7 +256,7 @@ docker exec opengauss-iceberg-fdw sh -lc '
 进入 `gsql`：
 
 ```bash
-cd /home/andy/opengauss_iceberg_fdw
+cd /path/to/opengauss_iceberg_fdw
 ./tools/opengauss-docker.sh gsql
 ```
 
