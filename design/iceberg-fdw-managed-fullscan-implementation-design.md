@@ -757,12 +757,20 @@ typedef struct IcebergFdwScanState {
 
 `BeginForeignScan` 不再重新查询 catalog 元数据。执行期所需的 `metadata_location`、`table_name`、`storage_config_json`、`scan_options_json` 和投影列名均由 `GetForeignPlan` / `icebergGetOptions()` 组合而来。若后续需要处理计划缓存失效或 schema 演进并发问题，应通过 catalog invalidation 或重新规划解决，而不是在 `BeginForeignScan` 中重新修正计划。
 
+这里要区分两层语义：
+
+- `metadata_location` 负责定位 Iceberg metadata 文件，扫描路径可以先按位置读表。
+- `namespace + table_name` 负责表的逻辑身份，不能被 `metadata_location` 替代。
+
+因此，当前扫描链路可以先继续按 `metadata_location` 打开表；但当 bridge 接口补齐后，FDW 仍应把 `namespace` 一并传下去，用于构造完整的 `TableIdent`。后续写入、提交、表身份校验和可能的 catalog 重新加载都依赖这个完整身份，不能只靠 `metadata_location` 反推出 namespace。
+
 SDK scan request：
 
 ```c
 typedef struct IcebergSdkScanRequest {
     const char *storage_config_json;
     const char *metadata_location;
+    const char *namespace_name;
     const char *table_name;
     const char *scan_options_json;
     List *projected_columns;
@@ -777,6 +785,7 @@ typedef struct IcebergSdkScanRequest {
 - `filter` 在 `scan_options_json` 中以 JSON 形式传入，bridge 负责把它反序列化为 iceberg-rust `Predicate`。
 - `snapshot_id` 的传递取决于 bridge 对应能力；当前实现优先通过 `metadata_location` 指向目标快照对应的 metadata。
 - Iceberg delete file/MOR 由 Rust SDK `to_arrow()` 路径默认应用，FDW 不自行实现 MOR 合并逻辑。
+- 当前 bridge 若仍只接受 `metadata_location + table_name`，可以先保持兼容实现；当 bridge 接口更新后，FDW 需要补齐 `namespace_name` 传递，不再用 `table_name` 代替 `TableIdent`。
 
 ### 7.8 `IterateForeignScan`
 
@@ -865,7 +874,7 @@ icebergIterateForeignScan(ForeignScanState *node)
 
 - FDW 编译期只依赖一个公共 C ABI 头，例如 `iceberg_bridge_abi.h`，不直接依赖 bridge Rust 内部结构。
 - 运行时通过 `dlopen()` / `dlsym()` 加载 `libiceberg_rust_bridge.so`。
-- 根据 `storage_config_json`、`metadata_location` 和 `table_name` 打开 Iceberg 表。
+- 根据 `storage_config_json`、`metadata_location`、`namespace_name` 和 `table_name` 打开 Iceberg 表，并构造正确的 `TableIdent`。
 - 按顶层列名做列裁剪，bridge 侧再由 Rust SDK 解析为 field id。
 - 接收 `scan_options_json`，由 bridge 将其中的 `filter` JSON 反序列化为 iceberg-rust `Predicate`。
 - 依赖 Rust SDK 自动完成分区/文件/列统计/row-group 剪枝和行级过滤。
@@ -902,6 +911,7 @@ void iceberg_sdk_scan_close(IcebergSdkScan *scan);
 - `scan_options_json` 里的 `filter` 必须是 bridge 可反序列化的 predicate JSON；当前实现使用 `Binary`、`Unary` 和 `And` 结构。
 - 已成功转换的 SDK filter 在 Rust Arrow 路径中执行行级过滤；本地 recheck 是首期防御策略或未下推残差处理，不是 Rust SDK 正确性的必要条件。
 - Rust SDK 默认处理 Iceberg position/equality delete；这与 openGauss delta 表不是同一概念。
+- 未来写入/提交路径不能只依赖 `metadata_location`；必须同时保证 `namespace_name`、`table_name` 和 `TableIdent` 与 catalog 绑定一致，否则提交阶段可能查错表或在身份校验阶段失败。
 
 ## 9. Delta Scan Adapter
 
