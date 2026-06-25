@@ -48,6 +48,10 @@ interface constraints, and follow existing openGauss FDW code patterns first.
   provided by the team.
 - Prefer calling existing team interfaces and clearly document interface
   boundaries.
+- Before starting code development, update the local dependent reference
+  repositories to their latest upstream commits, at minimum `openGauss-server/`
+  and `Catalog/`, and `iceberg-rust-bridge/` when the work touches bridge
+  behavior or ABI.
 - Before implementing, inspect openGauss FDW callbacks and contrib examples.
 - Update `README.md` or add focused design docs whenever new constraints are
   discovered.
@@ -104,6 +108,11 @@ Current implementation boundary:
   references and integration dependencies. Keep `iceberg_fdw/` independently
   buildable while aligning headers, hooks, catalog tables, and runtime behavior
   with those repositories.
+- Before starting code changes, refresh all relevant dependency repositories
+  to their upstream heads and verify the result with concrete revision checks.
+  Do not rely on a prior `pull` message alone. For any dependency repo touched
+  by the task, confirm both the fetched remote tip and the local `HEAD` match
+  the intended latest commit before diagnosing integration failures.
 - Runtime debugging should use the Docker openGauss instance from this project.
   Build/install the development shared library into that instance for testing;
   the final product packaging and preload strategy are still open.
@@ -116,6 +125,30 @@ Current implementation boundary:
 - Add focused unit/regression coverage whenever a development step introduces a
   new adapter boundary, catalog write, transaction callback, or type-mapping
   rule.
+- For local functional tests and regression checks, prefer a debug/assert
+  openGauss build so executor protocol violations, such as virtual tuple slot
+  misuse, fail immediately. Use a release build only for benchmark/performance
+  runs where optimization and throughput numbers matter.
+- Treat `ForeignScan.fdw_private` as an executable contract, not EXPLAIN-only
+  metadata. Every value serialized into `fdw_private` must be consumed by
+  `BeginForeignScan` or a lower execution adapter, or be explicitly named as
+  diagnostic-only in code and tests.
+- When a planner callback serializes scan options, filters, projections,
+  snapshot IDs, index requests, or other SDK/bridge inputs, trace the value all
+  the way to the concrete bridge ABI call before considering the change
+  complete.
+- Tests for pushdown must verify behavior at the adapter/bridge boundary, not
+  only planner classification or EXPLAIN text. A fake bridge used for tests
+  should assert the actual `scan_options`, `filter_json`, projection, snapshot,
+  or index request it receives.
+- When bridge ABI changes force request structs or adapter code to be rebuilt,
+  audit all fields removed from or added to the request type and confirm their
+  replacement path preserves behavior. Do not leave serialized plan state that
+  is read only for presence checks or EXPLAIN counters.
+- For filter pushdown specifically, keep three assertions aligned: the planner
+  classifies the qual as pushdown-capable, the executor passes the serialized
+  filter into `IcebergBridgeScanOptions.filter_json` or the current bridge
+  equivalent, and local quals/recheck behavior remains correct.
 
 ## Build Safety
 
