@@ -113,6 +113,12 @@ Current implementation boundary:
   Do not rely on a prior `pull` message alone. For any dependency repo touched
   by the task, confirm both the fetched remote tip and the local `HEAD` match
   the intended latest commit before diagnosing integration failures.
+- When the user asks to "提交", "提交到仓库", "上传到代码仓", or equivalent,
+  treat the task as incomplete until the relevant repository has fetched the
+  latest upstream branch, rebased or fast-forwarded onto it, committed only the
+  intended changes, and pushed successfully to the remote repository. A
+  local-only commit is not sufficient unless the user explicitly asks for a
+  local commit only.
 - Runtime debugging should use the Docker openGauss instance from this project.
   Build/install the development shared library into that instance for testing;
   the final product packaging and preload strategy are still open.
