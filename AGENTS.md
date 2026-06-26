@@ -134,6 +134,20 @@ openGauss FDW 现有代码模式。
 
 ## 构建安全
 
+- 物理机编译默认走 AD 主机快捷命令，不要重新推导或手工拼装构建流程。只要用户要求
+  “拉新代码编译”“物理机编译”“debug 编译”或等价表述，无论是否在同一会话中，都应：
+  1. 登录物理机 `opengauss-ad`。
+  2. 先按任务需要更新相关仓库到最新，并确认目标分支和 `HEAD`。
+  3. 直接调用 `/data/ad/tools/bin/ad-build` 编译。
+- 物理机全量 debug 构建命令：
+  `ssh opengauss-ad 'cd /data/ad && /data/ad/tools/bin/ad-build all'`
+- 物理机仅编译/验证 Iceberg 相关组件时使用：
+  `ssh opengauss-ad 'cd /data/ad && /data/ad/tools/bin/ad-build rust fdw catalog delta verify'`
+- 物理机仅验证当前安装产物时使用：
+  `ssh opengauss-ad 'cd /data/ad && /data/ad/tools/bin/ad-build verify'`
+- `/data/ad/tools/bin/ad-build` 已包含 AD 主机本地环境适配：Rust PATH 修复、Cargo native crate
+  编译所需 gcc support libs、bridge 对本地 `iceberg-index` crate 布局的兼容 patch、FDW/Catalog
+  clean 入口和 `CMAKE_BIN` wrapper。后续编译应优先维护这个快捷脚本，而不是在会话中散落临时命令。
 - 之前的本地源码构建路径导致过 OOM。除非用户明确要求，不要重试源码编译。
 - 优先使用 Docker image installation 和 runtime checks。
 - 在较长的 openGauss 或 C/C++ 构建前，运行 `free -h`。
