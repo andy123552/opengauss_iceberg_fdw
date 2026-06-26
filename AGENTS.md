@@ -1,185 +1,157 @@
 # Project Agent: openGauss Iceberg FDW
 
-## Role
+## 角色
 
-This project tracks openGauss FDW integration for accessing Iceberg lake tables.
-The agent should preserve project context, decompose implementation work, record
-interface constraints, and follow existing openGauss FDW code patterns first.
+本项目跟踪 openGauss 通过 FDW 访问 Iceberg 湖表的集成工作。
+Agent 需要保留项目上下文、拆解实现任务、记录接口约束，并优先遵循
+openGauss FDW 现有代码模式。
 
-## Project Summary
+## 项目摘要
 
-- Goal: access Iceberg tables from openGauss through FDW.
-- Required capabilities include index scan and DML write support.
-- Metadata management, low-level index structures, low-level index scan APIs,
-  and delta-table write APIs are expected to be provided by the team.
-- This project should implement the openGauss FDW-side planning, execution, DML,
-  transaction, option validation, and type conversion flow.
-- Current primary implementation direction is managed Iceberg foreign tables:
-  Iceberg metadata is created and evolved through openGauss foreign-table DDL.
-- Future scan evolution should consider choosing an index-backed scan during
-  execution when the team index APIs are available. Vector top-k paths may be
-  wrapped by an upper vector-search/refine step that performs local exact
-  refinement in openGauss.
+- 目标：通过 FDW 从 openGauss 访问 Iceberg 表。
+- 必需能力包括索引扫描和 DML 写入支持。
+- Iceberg 元数据管理、底层索引结构、底层索引扫描 API、delta 表写入
+  API 预期由团队提供。
+- 本项目应实现 openGauss FDW 侧的规划、执行、DML、事务、选项校验和
+  类型转换流程。
+- 当前主要实现方向是 managed Iceberg foreign table：Iceberg metadata
+  通过 openGauss foreign-table DDL 创建和演进。
+- 后续扫描演进应考虑：当团队索引 API 可用时，在执行阶段选择索引支撑
+  的扫描。向量 top-k 路径可由上层 vector-search/refine 步骤包裹，并在
+  openGauss 本地做精确 refinement。
 
-## Local Layout
+## 本地布局
 
-- Project root: `/home/andy/opengauss_iceberg_fdw`
-- openGauss source reference tree: `openGauss-server/`
-- Source reference repository:
+- 项目根目录：`/home/andy/opengauss_iceberg_fdw`
+- openGauss 源码参考树：`openGauss-server/`
+- 源码参考仓库：
   `https://github.com/DataInfraLab/openGauss-server-datainfra`
-- Source clone notes: `design/source-reference.md`
-- Catalog source reference tree: `Catalog/`
-- Catalog source reference repository: `https://github.com/HardingHang/Catalog`
-- Catalog source reference commit:
+- 源码克隆说明：`design/source-reference.md`
+- Catalog 源码参考树：`Catalog/`
+- Catalog 源码参考仓库：`https://github.com/HardingHang/Catalog`
+- Catalog 源码参考提交：
   `8ed555bc4db70e7f1fd2ca5b3722e5dc159d1b57`
-- FDW extension skeleton: `iceberg_fdw/`
-- Runtime mode: use the Docker image in `docker-compose.yml`; do not compile
-  the openGauss source tree by default.
-- Main project overview: `README.md`
-- Original context note: `AGENT.md`
-- Docker service: `opengauss`
-- Container name: `opengauss-iceberg-fdw`
-- Host port: `15432`
-- Default database password: `openGauss@123`
+- FDW 扩展骨架：`iceberg_fdw/`
+- 运行模式：使用 `docker-compose.yml` 中的 Docker 镜像；默认不要编译
+  openGauss 源码树。
+- 项目总览：`README.md`
+- Docker service：`opengauss`
+- 容器名：`opengauss-iceberg-fdw`
+- Host 端口：`15432`
+- 默认数据库密码：`openGauss@123`
 
-## Work Principles
+## 工作原则
 
-- Do not reimplement Iceberg metadata, index, or delta write internals already
-  provided by the team.
-- Prefer calling existing team interfaces and clearly document interface
-  boundaries.
-- Before starting code development, update the local dependent reference
-  repositories to their latest upstream commits, at minimum `openGauss-server/`
-  and `Catalog/`, and `iceberg-rust-bridge/` when the work touches bridge
-  behavior or ABI.
-- Before implementing, inspect openGauss FDW callbacks and contrib examples.
-- Update `README.md` or add focused design docs whenever new constraints are
-  discovered.
-- Be conservative around DML, transaction handling, error recovery, rollback,
-  and idempotency.
-- Preserve unrelated local changes. The source tree may contain generated files
-  from previous builds.
+- 不要重新实现团队已经提供的 Iceberg metadata、索引或 delta 写入底层能力。
+- 优先调用已有团队接口，并清晰记录接口边界。
+- 开始代码开发前，更新本地依赖参考仓库到最新 upstream 提交；至少包括
+  `openGauss-server/` 和 `Catalog/`，当工作触及 bridge 行为或 ABI 时还包括
+  `iceberg-rust-bridge/`。
+- 实现前先检查 openGauss FDW callbacks 和 contrib 示例。
+- 每当发现新约束时，更新 `README.md` 或新增聚焦的设计文档。
+- 对 DML、事务处理、错误恢复、回滚和幂等性保持保守。
+- 保留无关本地改动。源码树可能包含前序构建生成的文件。
 
-## Catalog Module Context
+## Catalog 模块上下文
 
-The team Catalog repository is cloned locally at `Catalog/` and is treated as
-an external source reference, not as code to vendor into this repo. Keep it out
-of normal commits.
+团队 Catalog 仓库本地克隆在 `Catalog/`，它是外部源码参考，不是要 vendor
+到本仓库的代码。正常提交中不要包含它。
 
-Confirmed Catalog capabilities from commit
-`8ed555bc4db70e7f1fd2ca5b3722e5dc159d1b57`:
+已确认 Catalog 在提交 `8ed555bc4db70e7f1fd2ca5b3722e5dc159d1b57` 的能力：
 
-- It is an openGauss extension named `iceberg_catalog`.
-- The SQL extension creates schema `iceberg_catalog`.
-- It defines metadata tables:
-  `namespaces`, `tables_internal`, `table_schemas`, `snapshots`,
-  `partition_specs`, and `tables_external`.
-- It defines compatibility views:
-  `iceberg_catalog.iceberg_tables` and
-  `iceberg_catalog.iceberg_namespace_properties`.
-- `tables_internal` is the FDW-relevant table binding local `relid` to
-  `namespace`, `table_name`, `table_uuid`, `metadata_location`,
-  `table_location`, `current_schema_id`, `current_snapshot_id`, and
-  `default_spec_id`.
-- `table_schemas` stores expanded top-level Iceberg schema fields by
-  `table_uuid`, `schema_id`, `field_position`, and stable Iceberg `field_id`.
-- `snapshots` stores snapshot summaries including `snapshot_id`, optional
-  `schema_id`, `manifest_list`, and `total_records`.
-- `partition_specs` stores partition-spec fields; an unpartitioned spec can be
-  represented by `field_position = -1`.
-- `tables_external` and the compatibility views are intended for JDBC Catalog
-  style external records without local relation binding.
+- 它是名为 `iceberg_catalog` 的 openGauss 扩展。
+- SQL 扩展创建 schema `iceberg_catalog`。
+- 它定义 metadata tables：
+  `namespaces`、`tables_internal`、`table_schemas`、`snapshots`、
+  `partition_specs` 和 `tables_external`。
+- 它定义兼容视图：
+  `iceberg_catalog.iceberg_tables` 和
+  `iceberg_catalog.iceberg_namespace_properties`。
+- `tables_internal` 是 FDW 相关的表绑定面，把本地 `relid` 绑定到
+  `namespace`、`table_name`、`table_uuid`、`metadata_location`、
+  `table_location`、`current_schema_id`、`current_snapshot_id` 和
+  `default_spec_id`。
+- `table_schemas` 按 `table_uuid`、`schema_id`、`field_position` 和稳定的
+  Iceberg `field_id` 存储展开后的顶层 Iceberg schema 字段。
+- `snapshots` 存储 snapshot 摘要，包括 `snapshot_id`、可选 `schema_id`、
+  `manifest_list` 和 `total_records`。
+- `partition_specs` 存储 partition-spec 字段；未分区 spec 可以用
+  `field_position = -1` 表示。
+- `tables_external` 和兼容视图用于 JDBC Catalog 风格的外部记录，不包含
+  本地 relation 绑定。
 
-Current implementation boundary:
+当前实现边界：
 
-- `iceberg_catalog.create_table(...)` exists as a C-language SQL function, but
-  its C implementation is currently a stub. It validates required arguments and
-  returns a placeholder JSONB response.
-- The C stub contains TODOs for schema validation, namespace/table existence
-  checks, Iceberg SDK `CreateTable`, storage creation, and metadata-table
-  registration.
-- For FDW scan planning today, use the catalog metadata tables/views as the
-  reliable integration surface. Do not assume the `create_table` function
-  creates real Iceberg metadata until the TODOs are implemented.
+- `iceberg_catalog.create_table(...)` 是一个 C-language SQL function，但它的
+  C 实现目前仍是 stub。它会校验必填参数，并返回占位 JSONB response。
+- 这个 C stub 中包含 TODO：schema validation、namespace/table existence
+  checks、Iceberg SDK `CreateTable`、storage creation 和 metadata-table
+  registration。
+- 当前 FDW scan planning 应把 catalog metadata tables/views 作为可靠的集成
+  表面。在 TODO 实现前，不要假设 `create_table` function 会创建真实的
+  Iceberg metadata。
 
-## Current Development Principles
+## 当前开发原则
 
-- The local `openGauss-server/` and `Catalog/` repositories are development
-  references and integration dependencies. Keep `iceberg_fdw/` independently
-  buildable while aligning headers, hooks, catalog tables, and runtime behavior
-  with those repositories.
-- Before starting code changes, refresh all relevant dependency repositories
-  to their upstream heads and verify the result with concrete revision checks.
-  Do not rely on a prior `pull` message alone. For any dependency repo touched
-  by the task, confirm both the fetched remote tip and the local `HEAD` match
-  the intended latest commit before diagnosing integration failures.
-- When the user asks to "提交", "提交到仓库", "上传到代码仓", or equivalent,
-  treat the task as incomplete until the relevant repository has fetched the
-  latest upstream branch, rebased or fast-forwarded onto it, committed only the
-  intended changes, and pushed successfully to the remote repository. A
-  local-only commit is not sufficient unless the user explicitly asks for a
-  local commit only.
-- Runtime debugging should use the Docker openGauss instance from this project.
-  Build/install the development shared library into that instance for testing;
-  the final product packaging and preload strategy are still open.
-- Follow a test-first flow for feature work. Add target SQL/regression or unit
-  tests before implementing behavior, then use them to guard each incremental
-  step.
-- Use `pg_lake/` as an external reference for DDL handling, extension test
-  layout, and error-path coverage, but do not vendor pg_lake code into this
-  project.
-- Add focused unit/regression coverage whenever a development step introduces a
-  new adapter boundary, catalog write, transaction callback, or type-mapping
-  rule.
-- For local functional tests and regression checks, prefer a debug/assert
-  openGauss build so executor protocol violations, such as virtual tuple slot
-  misuse, fail immediately. Use a release build only for benchmark/performance
-  runs where optimization and throughput numbers matter.
-- Treat `ForeignScan.fdw_private` as an executable contract, not EXPLAIN-only
-  metadata. Every value serialized into `fdw_private` must be consumed by
-  `BeginForeignScan` or a lower execution adapter, or be explicitly named as
-  diagnostic-only in code and tests.
-- When a planner callback serializes scan options, filters, projections,
-  snapshot IDs, index requests, or other SDK/bridge inputs, trace the value all
-  the way to the concrete bridge ABI call before considering the change
-  complete.
-- Tests for pushdown must verify behavior at the adapter/bridge boundary, not
-  only planner classification or EXPLAIN text. A fake bridge used for tests
-  should assert the actual `scan_options`, `filter_json`, projection, snapshot,
-  or index request it receives.
-- When bridge ABI changes force request structs or adapter code to be rebuilt,
-  audit all fields removed from or added to the request type and confirm their
-  replacement path preserves behavior. Do not leave serialized plan state that
-  is read only for presence checks or EXPLAIN counters.
-- For filter pushdown specifically, keep three assertions aligned: the planner
-  classifies the qual as pushdown-capable, the executor passes the serialized
-  filter into `IcebergBridgeScanOptions.filter_json` or the current bridge
-  equivalent, and local quals/recheck behavior remains correct.
+- 本地 `openGauss-server/` 和 `Catalog/` 仓库是开发参考和集成依赖。
+  `iceberg_fdw/` 应保持可独立构建，同时在 headers、hooks、catalog tables
+  和 runtime behavior 上与这些仓库对齐。
+- 开始代码修改前，刷新所有相关依赖仓库到 upstream head，并用具体 revision
+  检查结果。不要只依赖之前的“已 pull”消息。对于任务触及的任何依赖仓库，
+  在诊断集成失败前，确认 fetched remote tip 和本地 `HEAD` 都匹配目标最新
+  提交。
+- 当用户要求“提交”、“提交到仓库”、“上传到代码仓”或等价表述时，任务只有在
+  相关仓库完成 fetch 最新 upstream 分支、rebase 或 fast-forward 到最新、
+  只提交目标改动、并成功 push 到远端仓库后才算完成。除非用户明确要求只做
+  本地 commit，否则 local-only commit 不足以结束任务。
+- runtime debugging 应使用本项目的 Docker openGauss 实例。把开发中的 shared
+  library build/install 到该实例中测试；最终产品 packaging 和 preload 策略
+  仍未定。
+- 功能开发遵循 test-first 流程。实现行为前先添加目标 SQL/regression 或
+  unit tests，再用这些测试守住每个增量步骤。
+- 使用 `pg_lake/` 作为 DDL handling、extension test layout 和 error-path
+  coverage 的外部参考，但不要 vendor pg_lake 代码到本项目。
+- 每当开发步骤引入新的 adapter boundary、catalog write、transaction callback
+  或 type-mapping rule 时，都要补充聚焦的 unit/regression 覆盖。
+- 本地功能测试和回归检查优先使用 debug/assert openGauss build，让 executor
+  protocol violations（例如 virtual tuple slot misuse）立即失败。release build
+  只用于 benchmark/performance 场景，在这些场景中优化和吞吐数字才重要。
+- 把 `ForeignScan.fdw_private` 视为可执行契约，而不是 EXPLAIN-only metadata。
+  每个序列化进 `fdw_private` 的值都必须被 `BeginForeignScan` 或更低层执行
+  adapter 消费；否则必须在代码和测试中明确命名为 diagnostic-only。
+- 当 planner callback 序列化 scan options、filters、projections、snapshot IDs、
+  index requests 或其他 SDK/bridge inputs 时，必须把该值一路追踪到具体
+  bridge ABI call，之后才能认为改动完成。
+- pushdown 测试必须验证 adapter/bridge 边界行为，而不只是 planner
+  classification 或 EXPLAIN 文本。测试中使用的 fake bridge 应断言它实际收到的
+  `scan_options`、`filter_json`、projection、snapshot 或 index request。
+- 当 bridge ABI 变化导致 request structs 或 adapter code 需要重建时，审计
+  request type 中所有被删除或新增的字段，并确认替代路径保持行为不变。不要
+  留下只用于 presence checks 或 EXPLAIN counters 的 serialized plan state。
+- 对 filter pushdown，必须保持三类断言一致：planner 将 qual 分类为可 pushdown；
+  executor 将序列化 filter 传入 `IcebergBridgeScanOptions.filter_json` 或当前
+  bridge 等价字段；local quals/recheck behavior 仍然正确。
 
-## Build Safety
+## 构建安全
 
-- The previous local source build path caused OOM. Do not retry source
-  compilation unless explicitly requested.
-- Prefer Docker image installation and runtime checks.
-- Before long openGauss or C/C++ builds, run `free -h`.
-- Check for stale compiler/build processes with:
+- 之前的本地源码构建路径导致过 OOM。除非用户明确要求，不要重试源码编译。
+- 优先使用 Docker image installation 和 runtime checks。
+- 在较长的 openGauss 或 C/C++ 构建前，运行 `free -h`。
+- 检查遗留 compiler/build 进程：
   `ps -eo pid,ppid,cmd | rg 'make|gcc|g\\+\\+|cc1|cc1plus'`
-- Avoid unbounded parallelism. Use `MAKEFLAGS=-j2`, `make -j2`, or the nearest
-  project-supported job flag.
-- Do not use `make -j` or `-j$(nproc)` unless explicitly requested.
-- Capture long build output to a log file and inspect with `tail` or `rg`.
-- If memory pressure or swap usage rises sharply, stop and report the resource
-  bottleneck.
+- 避免无界并行。使用 `MAKEFLAGS=-j2`、`make -j2`，或最接近的项目支持 job flag。
+- 除非用户明确要求，不要使用 `make -j` 或 `-j$(nproc)`。
+- 长构建输出要写入日志文件，并用 `tail` 或 `rg` 检查。
+- 如果内存压力或 swap 使用量快速升高，停止并报告资源瓶颈。
 
-## Likely Next Steps
+## 可能的后续步骤
 
-1. Use `openGauss-server/` as a source reference for FDW callback and contrib
-   implementation comparisons.
-2. Confirm or repair local Docker-based openGauss runtime environment.
-3. Record team-provided Iceberg metadata, index scan, and delta write APIs when
-   available.
-4. Implement a minimal Iceberg FDW extension skeleton.
-5. Add managed foreign-table DDL hooks and full-scan execution first.
-6. Add DML callbacks and transaction integration for delta writes.
-7. Add index-backed scan and vector-search/refine integration after the basic
-   managed full-scan path is stable.
+1. 使用 `openGauss-server/` 作为 FDW callback 和 contrib implementation
+   对比参考。
+2. 确认或修复本地 Docker-based openGauss runtime environment。
+3. 记录团队提供的 Iceberg metadata、index scan 和 delta write APIs。
+4. 实现最小 Iceberg FDW extension skeleton。
+5. 先添加 managed foreign-table DDL hooks 和 full-scan execution。
+6. 添加 DML callbacks 和 delta writes 的 transaction integration。
+7. 在基础 managed full-scan path 稳定后，添加 index-backed scan 和
+   vector-search/refine integration。
