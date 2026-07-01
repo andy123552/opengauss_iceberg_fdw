@@ -397,6 +397,44 @@ IcebergBridgeStatus iceberg_index_rs_vacuum_index_by_metadata(
     IcebergBridgeError** err);
 ```
 
+
+### 5.5 cleanup old metadata ABI
+
+`cleanup_old_metadata` 是 metadata 目录专用维护接口，不能复用
+`remove_orphan_files`。bridge C ABI 只接收 `metadata_location` 和策略参数，
+不接收 REST catalog URI，也不在 bridge 侧自行发现 current pointer。
+
+```c
+typedef struct {
+  const char* table_namespace_json;
+  const char* table_name;
+  const char* metadata_location;
+  int64_t older_than_ms;              /* <= 0 means default 7 days */
+  int32_t retain_last;                /* <= 0 means default 100 */
+  bool dry_run;
+  bool verbose;
+} IcebergBridgeCleanupOldMetadataRequest;
+
+IcebergBridgeStatus iceberg_bridge_table_cleanup_old_metadata(
+    IcebergBridgeStorage* storage,
+    const IcebergBridgeCleanupOldMetadataRequest* request,
+    IcebergBridgeString** out,
+    IcebergBridgeError** err);
+```
+
+实现要求：
+
+- 加载 `metadata_location` 指定的 table，并把该 metadata 文件视为 current。
+- 只扫描 `<table_location>/metadata/` 下的 table metadata json 文件。
+- 不通过该接口删除 data/delete files、index artifact、statistics Puffin、manifest-list
+  或 manifest 文件；这些文件分别由 `remove_orphan_files`、`vacuum_index` 或
+  `expire_snapshots` 后续组合流程处理。
+- dry-run 只返回候选和 skipped 统计，不删除物理文件。
+- execute 删除每个候选 metadata json 前必须重新 stat 并复查安全窗口。
+- 删除失败写入 `failed`，不影响其他候选文件的 best-effort 删除。
+- 返回 JSON 的 `operation` 必须为 `cleanup_old_metadata`，`scope` 必须声明为
+  `metadata_json_only`。
+
 ## 6. Rust SDK / iceberg-index 实现
 
 ### 6.1 常规 Iceberg maintenance
@@ -505,6 +543,85 @@ pub struct MetadataIndexVacuumRequest {
 - 能从 registry 中确认属于该 index 的 artifact 才按 index_name 精确清理。
 - 对完全 orphan、无法归属某个 index 的文件，只有 `index_name IS NULL` 时才清理。
 - 指定 `index_name` 时，不删除无法归属的 orphan 文件，计入 `skipped`。
+
+
+### 6.4 cleanup old metadata
+
+在 `iceberg-index` 中新增 metadata cleanup SDK，并由 bridge C ABI 调用该 SDK，
+避免 bridge 和 SDK 各自维护一套 metadata 文件判断逻辑。
+
+建议新增文件：
+
+```text
+crates/iceberg-index-abi/src/maintenance.rs
+crates/iceberg-index-iceberg/src/metadata_cleanup.rs
+```
+
+核心请求结构：
+
+```rust
+pub struct MetadataCleanupOldMetadataRequest {
+    pub table_namespace: Vec<String>,
+    pub table_name: String,
+    pub metadata_location: String,
+    pub older_than_ms: i64,
+    pub retain_last: i32,
+    pub dry_run: bool,
+    pub verbose: bool,
+    pub file_io_config_json: String,
+}
+
+impl IndexEngine {
+    pub fn cleanup_old_metadata_by_metadata(
+        &self,
+        request: &MetadataCleanupOldMetadataRequest,
+    ) -> Result<String>;
+}
+```
+
+核心算法：
+
+```text
+1. load table from metadata_location
+2. resolve table_location and current metadata json path
+3. list {table_location}/metadata recursively
+4. parse candidate *.metadata.json files and validate table-uuid
+5. build protected metadata json set
+   - current metadata_location
+   - metadata log / previous metadata log entries retained by current metadata
+   - latest retain_last metadata json files by version or timestamp
+   - files inside grace period
+6. candidate = actual_metadata_json_files - protected_metadata_json_files
+7. skip files with missing mtime, parse failure, uuid mismatch, path outside metadata/
+8. dry-run returns candidates/skipped/failed without deleting
+9. execute re-stat each candidate, re-check grace period, then delete best-effort
+```
+
+保护规则：
+
+- 必须保护当前 `metadata_location` 指向的 metadata json。
+- 必须保护 metadata log / previous metadata log 中仍保留的 metadata json。
+- 必须保护最近 `retain_last` 个 metadata json，默认值由 catalog 传入 100。
+- 必须保护安全窗口内的文件，默认窗口由 catalog 传入 7 天。
+- 如果发现 metadata json 的 `table-uuid` 不是当前表 UUID，必须 fail closed，拒绝清理。
+- 不能删除 manifest-list、manifest、statistics Puffin 或 index registry Puffin；本接口只处理
+  table metadata json。
+- 无法证明安全的文件计入 `skipped`，不得删除。
+
+返回 JSON 字段需要和通用 maintenance 返回保持一致，并额外包含：
+
+```json
+{
+  "operation": "cleanup_old_metadata",
+  "scope": "metadata_json_only",
+  "base_metadata_location": "...",
+  "retained_metadata_count": 0,
+  "candidate_file_count": 0,
+  "deleted_file_count": 0,
+  "skipped_file_count": 0,
+  "failed": []
+}
+```
 
 ## 7. 安全与并发语义
 
