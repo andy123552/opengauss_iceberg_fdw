@@ -104,6 +104,12 @@ openGauss FDW 现有代码模式。
   相关仓库完成 fetch 最新 upstream 分支、rebase 或 fast-forward 到最新、
   只提交目标改动、并成功 push 到远端仓库后才算完成。除非用户明确要求只做
   本地 commit，否则 local-only commit 不足以结束任务。
+- 开发实现、接口对齐和行为判断所参考的设计文档，只能以项目根仓库 `design/`
+  目录第一层的相应设计文档为准。依赖仓库、子仓库或其他目录中的设计文档只能作为
+  历史/背景参考，不能覆盖根仓 `design/` 下的主设计文档。
+- 修改任何位置的设计文档时，无论该文档位于依赖仓库、子仓库还是其他目录，都必须
+  同步检查并更新项目根仓库 `design/` 目录第一层的对应设计文档，确保根仓设计文档
+  始终是实现依据和最新事实来源。
 - runtime debugging 应使用本项目的 Docker openGauss 实例。把开发中的 shared
   library build/install 到该实例中测试；最终产品 packaging 和 preload 策略
   仍未定。
