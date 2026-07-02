@@ -2,220 +2,367 @@
 
 ## 1. 背景
 
-openGauss Iceberg 集成当前通过 `iceberg_catalog.tables_internal.metadata_location`
-管理 Iceberg 表的当前元数据指针。FDW 负责查询扫描，不参与表维护命令。表维护入口统一放在
-`iceberg_catalog` 扩展中，由 SQL 函数同步触发 bridge 和 Rust SDK 能力。
+openGauss Iceberg 集成通过 `iceberg_catalog.tables_internal.metadata_location` 管理 Iceberg 表的当前
+metadata pointer。FDW 只负责查询和扫描，不参与表维护命令。GC / 维护入口统一放在
+`iceberg_catalog` 扩展中，由 Catalog SQL 函数同步调用 bridge C ABI，再由 bridge 调用 Rust SDK。
 
-第一阶段解决不需要改写 Iceberg `metadata.json` 的物理文件清理问题：
+第一阶段只解决“不需要改写 Iceberg metadata.json”的清理问题：
 
-- 写入任务失败、取消、进程崩溃后，可能留下未被任何 Iceberg metadata 引用的数据文件。
-- drop/rebuild index 只更新索引 registry，不应立即物理删除历史查询仍可能依赖的索引文件。
-- 多次提交会积累旧 table metadata json；这些文件不属于数据文件，不能混入 orphan data cleanup。
+- 写入任务失败、取消或进程崩溃后，可能留下未被任何 Iceberg metadata 引用的 data/delete 文件。
+- 多次提交会积累旧 table metadata json；这些文件不能混在 data orphan cleanup 中处理。
+- drop/rebuild index 只应更新索引 registry，不能立即物理删除历史查询仍可能依赖的 index registry / segment 文件。
 
-第一阶段接口全部是目录扫描型维护动作，只清理已能证明安全的物理文件，不修改
-`tables_internal.metadata_location`，不生成新的 Iceberg metadata，不执行 Catalog CAS。
+第一阶段接口全部是目录扫描型维护动作。它们不会生成新的 Iceberg metadata，不会更新
+`tables_internal.metadata_location`，也不会执行 Catalog CAS。
 
-参考实现边界：
+Iceberg 原生维护中，`expire_snapshots` 用于过期 snapshot 并删除只被过期 snapshot 独占引用的 data/delete、
+manifest、manifest-list、statistics 文件；`remove_orphan_files` 用于清理不被 metadata 引用的孤儿文件，且官方提醒
+retention 过短会误删尚未提交的写入文件。LanceDB OSS 倾向于用 `optimize()` 组合 compaction、cleanup 和索引维护。
+本项目采用 Iceberg 的独立动作语义，并把组合入口留到第二阶段 Catalog orchestration 中设计。
 
-- Iceberg 原生维护能力包含 snapshot 过期、orphan 文件清理和旧 metadata 清理。Iceberg 文档明确
-  `remove_orphan_files` 需要保留足够长的 retention interval，否则可能删除正在写入但尚未提交的文件。
-  Spark procedure 默认 orphan retention 是 3 天，`expire_snapshots` 默认 `retain_last=1`，并保护仍被
-  branch/tag 引用的 snapshot。
-- LanceDB OSS 将 compaction、旧版本清理和索引更新组合在 `optimize()` 中，默认 7 天 retention；
-  tagged versions 不会被 cleanup 删除。
-- 本项目采用 Iceberg 的独立维护动作语义，同时保留 LanceDB 风格的可选 Catalog 组合入口，但第一阶段
-  不引入后台任务表、维护队列或常驻调度服务。
+## 2. 接口规格、约束与设计边界
 
-参考文档：
+### 2.1 对外 SQL 接口规格
 
-- Apache Iceberg maintenance: <https://iceberg.apache.org/docs/latest/maintenance/>
-- Apache Iceberg Spark procedures: <https://iceberg.apache.org/docs/latest/spark-procedures/>
-- LanceDB reindexing / optimize: <https://docs.lancedb.com/indexing/reindexing>
-- LanceDB performance / cleanup: <https://docs.lancedb.com/performance>
-- LanceDB version retention: <https://docs.lancedb.com/tables/versioning>
+| 接口 | 参数 | 类型 / 默认值 | 含义 | 返回 |
+| --- | --- | --- | --- | --- |
+| `remove_orphan_files` | `p_namespace` | `text`，必填 | Catalog namespace | `jsonb` |
+|  | `p_table` | `text`，必填 | Catalog table name |  |
+|  | `older_than` | `interval DEFAULT interval '7 days'` | 候选文件 mtime 必须早于 `now - older_than` |  |
+|  | `dry_run` | `boolean DEFAULT true` | true 只返回候选；false 执行删除 |  |
+|  | `verbose` | `boolean DEFAULT false` | true 返回候选、删除、跳过明细 |  |
+| `cleanup_old_metadata` | `p_namespace` | `text`，必填 | Catalog namespace | `jsonb` |
+|  | `p_table` | `text`，必填 | Catalog table name |  |
+|  | `older_than` | `interval DEFAULT interval '7 days'` | 候选 metadata json mtime 必须早于安全窗口 |  |
+|  | `retain_last` | `integer DEFAULT 100` | 除 current/log 保护外，额外保留最近 N 个 table metadata json；必须为正整数 |  |
+|  | `dry_run` | `boolean DEFAULT true` | true 只返回候选；false 执行删除 |  |
+|  | `verbose` | `boolean DEFAULT false` | true 返回明细 |  |
+| `vacuum_index` | `p_namespace` | `text`，必填 | Catalog namespace | `jsonb` |
+|  | `p_table` | `text`，必填 | Catalog table name |  |
+|  | `index_name` | `text DEFAULT NULL` | NULL 表示清理全表索引；非 NULL 时只清理可证明属于该 index 的文件 |  |
+|  | `older_than` | `interval DEFAULT interval '7 days'` | 候选 index 文件 mtime 必须早于安全窗口 |  |
+|  | `dry_run` | `boolean DEFAULT true` | true 只返回候选；false 执行删除 |  |
+|  | `verbose` | `boolean DEFAULT false` | true 返回明细 |  |
 
-## 2. 功能约束与设计边界
+所有接口使用 `p_namespace` / `p_table` 定位 `iceberg_catalog.tables_internal` 记录，不要求调用方传 `regclass`。
 
-### 2.1 维护范围
+### 2.2 对外行为约束
 
-第一阶段提供三个独立 SQL 入口：
-
-```sql
-iceberg_catalog.remove_orphan_files(...)
-iceberg_catalog.cleanup_old_metadata(...)
-iceberg_catalog.vacuum_index(...)
-```
-
-三个入口都必须满足：
-
-- 使用 `p_namespace text` 和 `p_table text` 定位表，不要求调用方传 `regclass`。
-- 通过 `tables_internal` 获取 `table_uuid`、`table_location`、`metadata_location`、`current_snapshot_id`。
-- 统一返回 `jsonb`。
 - 默认 `dry_run=true`。
 - 默认安全窗口为 7 天。
-- 只删除 100% 确认安全的文件；不能确认时必须 fail closed，表现为请求级错误或文件级 `skipped`。
-- 不新增维护任务表，不引入维护队列，不引入后台 scheduler。
-- 不修改 `tables_internal.metadata_location`。
-- 不绕过 openGauss Catalog 直接连接 REST Catalog 并提交 table metadata。
+- 调用是同步的；本阶段不新增维护任务表、维护队列或后台 scheduler。
+- 请求级错误抛 SQL ERROR 或 C ABI error；文件级删除失败保存在返回 JSON 的 `failed` 中。
+- 未配置 S3 或对象存储时，相关集成测试可以跳过，但本地 FileIO 回归必须可一键运行。
 
-### 2.2 术语
+### 2.3 用户定义约束
 
-- `metadata_location`：`tables_internal.metadata_location` 中记录的当前 Iceberg metadata json URI，是
-  本项目唯一的表状态入口。
-- `table_location`：Iceberg table root URI，来自当前 table metadata 或 Catalog 表记录。
-- `安全窗口`：候选文件最后修改时间必须早于 `now - older_than`，默认 7 天。mtime 缺失或无法判断时不得删除。
-- `fail closed`：只要安全判断无法完成，就拒绝本次清理或跳过该文件；不得猜测删除。
-- `protected set`：必须保留的文件集合。
-- `candidate set`：经过引用关系和路径范围筛选后，可能可以删除的文件集合。
-- `execute`：`dry_run=false`，允许执行物理删除；仍必须逐文件复查保护规则。
+用户和 Catalog 建表逻辑必须保证：
 
-### 2.3 与 Iceberg / LanceDB 的接口对比
+- 不同 Iceberg 表的 `table_location` 不能完全相同。
+- 不同 Iceberg 表的 `table_location` 不能存在父子包含关系。
+- 表的 storage config 必须能同时被扫描、维护和索引 SDK 正确解析。
 
-| 能力 | Iceberg 原生行为 | LanceDB 行为 | 本项目第一阶段设计 |
+当前实现如果尚未在 `create_table` 阶段强制校验 table_location 唯一性，也必须在维护入口通过 table UUID 和路径规则 fail closed，不能猜测删除。
+
+### 2.4 内部实现约束
+
+- 第一阶段不得修改 `tables_internal.metadata_location`。
+- 第一阶段不得写新的 Iceberg table metadata json。
+- bridge 只做 C ABI 参数转换和错误映射；核心清理算法放在 `iceberg-index` SDK。
+- 删除前必须重新 `stat` 候选文件并复查安全窗口。
+- mtime 缺失、路径越界、URI 无法规范化、table UUID 不匹配、Puffin 归属不明时不得删除。
+- NotFound 按幂等成功处理，但明细中记录 `reason=not_found`。
+- 所有路径比较必须解析 URI 后分别比较 scheme、authority/bucket 和 normalized path，不能只做字符串前缀匹配。
+
+### 2.5 删除范围约束
+
+| 文件类型 | 第一阶段处理接口 | 说明 |
+| --- | --- | --- |
+| `data/` 下未被任何有效 snapshot 引用的 data/delete 文件 | `remove_orphan_files` | 只处理 `{table_location}/data/` |
+| 旧 table metadata json | `cleanup_old_metadata` | 只处理 `{table_location}/metadata/*.metadata.json` |
+| index registry Puffin / index segment artifact | `vacuum_index` | 保护 retained snapshot / reference 可达索引 |
+| manifest / manifest-list | 不在第一阶段处理 | 由第二阶段 `expire_snapshots` 的 `old_refs - new_refs` 删除；普通 orphan 扫描不碰 |
+| Iceberg 原生 statistics Puffin | 不在第一阶段处理 | 由第二阶段 `expire_snapshots` 在确认新 metadata 不再引用后删除 |
+
+manifest 和 manifest-list 的清理归属：Iceberg 原生 `expire_snapshots` 会报告并删除过期 snapshot 独占引用的 manifest
+和 manifest-list；本项目也把这类文件放到第二阶段 `delete_expired_snapshot_files` 中处理。第一阶段不扫描 metadata
+目录下的 manifest 或 manifest-list，以避免误删仍被 rollback、time travel、并发读或未发布 metadata 使用的文件。
+
+### 2.6 Iceberg / LanceDB 对比
+
+| 能力 | Iceberg 原生行为 | LanceDB 行为 | 本项目第一阶段 |
 | --- | --- | --- | --- |
-| orphan 文件清理 | `remove_orphan_files` / `deleteOrphanFiles` 清理未被 metadata 引用且超过 retention 的文件；短 retention 有误删风险 | `optimize()` 的 cleanup 会清理旧版本文件 | 独立 `remove_orphan_files`，只扫描 `{table_location}/data/`，默认 7 天，路径和 UUID 校验更保守 |
-| 旧 metadata json 清理 | Iceberg writer 可通过 `write.metadata.delete-after-commit.enabled` 和 `write.metadata.previous-versions-max` 自动删除旧 metadata；也可由维护动作处理 | 旧版本由 cleanup/optimize 按 retention 清理 | 独立 `cleanup_old_metadata`，只处理 table metadata json，默认保留最近 100 个并支持用户传参 |
-| index 文件清理 | Iceberg 原生没有本项目自定义 index registry / segment 语义 | `optimize()` 会组合索引更新；旧版本保留受 retention/tag 保护 | 独立 `vacuum_index`，mark-and-sweep，保护历史 snapshot / branch / tag / reference 可达索引 |
-| 组合入口 | Spark procedures 通常是独立调用 | `optimize()` 是组合入口 | 可选 `gc_table(...)` 只在 Catalog 层编排独立接口，不新增 bridge / SDK 组合 ABI |
-| 后台任务 | 取决于引擎或用户调度 | OSS 手动，Enterprise 可自动 | 不设计后台任务；调用方用 cron、脚本或数据库任务调 SQL |
+| orphan 文件清理 | `remove_orphan_files` 清理不被 metadata 引用且超过 retention 的文件；retention 过短有误删风险 | `optimize()` 的 cleanup 会清理旧版本文件 | 独立 `remove_orphan_files`，只扫 `data/`，默认 7 天 |
+| 旧 metadata json | 可用 `write.metadata.delete-after-commit.enabled` 和 `write.metadata.previous-versions-max` 控制；未跟踪 metadata 也可被 orphan deletion 清理 | 旧版本由 cleanup/optimize 清理 | 独立 `cleanup_old_metadata`，默认 `retain_last=100`，用户可传参 |
+| manifest / manifest-list | `expire_snapshots` 删除不再被有效 snapshot 引用的 manifest / manifest-list | cleanup 由 optimize 组合完成 | 第一阶段不清理，第二阶段处理 |
+| index 文件 | Iceberg 无本项目自定义 index registry / segment | optimize 会组合索引维护 | 独立 `vacuum_index`，保护历史 snapshot 查询 |
+| 组合入口 | Spark procedures 多为独立动作 | `optimize()` 是组合入口 | 放到第二阶段 Catalog 组合入口中 |
 
-差异原因：
+## 3. 术语
 
-- 本项目的 metadata pointer 由 openGauss Catalog 管理，bridge / SDK 不能直接成为当前 metadata 的事实来源。
-- 自定义 index registry 和 segment artifact 不是 Iceberg 原生文件类型，必须单独定义保护规则。
-- 为避免误删，第一阶段仅做目录扫描型清理，不做 snapshot expire 的 metadata rewrite。
+- `metadata_location`：Catalog 记录的当前 Iceberg metadata json URI，是本项目唯一的表状态入口。
+- `table_location`：Iceberg table root URI。
+- `安全窗口`：文件最后修改时间必须早于 `now - older_than`；默认 7 天。
+- `protected set`：必须保留的文件集合，例如 current metadata、metadata log、最近 `retain_last` 个 metadata json。
+- `live set`：仍被有效表状态引用的文件集合，通常用于 index vacuum；`live_index_files` 表示 retained snapshot / reference 可达 registry 中仍引用的 index 文件。
+- `actual set`：对象存储目录扫描得到的实际文件集合。
+- `candidate set`：`actual set - protected/live set` 后得到的候选集合，仍必须经过安全窗口和归属校验。
+- `retained snapshot`：不会被过期或仍需支持 time travel / branch / tag / reference 查询的 snapshot。
+- `unknown metadata json`：扫描 `{table_location}/metadata/` 后发现、且不在 `protected_metadata_files` 中的 `*.metadata.json` 文件。它可能是旧版本、失败写出的未发布 metadata、其他表误放文件或损坏文件，必须解析并校验 table UUID 后才能进入候选集合。
+- `fail closed`：无法证明安全时拒绝或跳过，不猜测删除。
 
-## 3. 使用示例与测试目标
+## 4. 具体使用场景
 
-### 3.1 remove_orphan_files
+### 4.1 remove_orphan_files 场景
+
+表 `db.events` 当前 metadata 为 `metadata/v0005.metadata.json`，当前和历史有效 snapshots 引用：
+
+```text
+s3://lake/db/events/data/2026-06-01/a.parquet
+s3://lake/db/events/data/2026-06-02/b.parquet
+s3://lake/db/events/data/delete/d1.parquet
+```
+
+对象存储实际文件：
+
+```text
+s3://lake/db/events/data/2026-06-01/a.parquet          # referenced, keep
+s3://lake/db/events/data/2026-06-02/b.parquet          # referenced, keep
+s3://lake/db/events/data/delete/d1.parquet             # referenced delete file, keep
+s3://lake/db/events/data/tmp/job-1.parquet             # unreferenced, mtime 10 days ago, delete
+s3://lake/db/events/data/tmp/job-2.parquet             # unreferenced, mtime 2 hours ago, skip
+s3://lake/db/events/metadata/v0003.metadata.json       # not in data/, ignore
+s3://lake/db/events/indices/idx-1/seg-1.puffin         # not in data/, ignore
+```
+
+调用：
 
 ```sql
 SELECT iceberg_catalog.remove_orphan_files(
     p_namespace => 'db',
     p_table => 'events',
     older_than => interval '7 days',
-    dry_run => true,
+    dry_run => false,
     verbose => true
 );
 ```
 
-目标场景：
+结果边界：
 
-- 表存在正常 snapshot，同时 `data/` 下存在一个未被任何 snapshot manifest 引用的旧文件。
-- `dry_run=true` 返回候选，不删除。
-- `dry_run=false` 删除超过安全窗口且仍未被引用的候选。
-- mtime 在 7 天窗口内、mtime 缺失、路径越界、UUID 校验失败的文件都不得删除。
+- 删除 `data/tmp/job-1.parquet`。
+- 跳过 `data/tmp/job-2.parquet`，原因是安全窗口内。
+- 保留所有 referenced files。
+- 不处理 metadata 和 indices 目录。
 
-约束场景：
+返回示例：
 
-- 不扫描 `metadata/`。
-- 不扫描 `indices/`。
-- 不清理 manifest、manifest-list、statistics Puffin、index registry Puffin、index segment artifact。
+```json
+{
+  "operation": "remove_orphan_files",
+  "dry_run": false,
+  "scope": "data_files_only",
+  "table": "db.events",
+  "base_metadata_location": "s3://lake/db/events/metadata/v0005.metadata.json",
+  "new_metadata_location": null,
+  "candidate_file_count": 1,
+  "deleted_file_count": 1,
+  "skipped_file_count": 1,
+  "failed_file_count": 0,
+  "removed": [
+    {"path": "s3://lake/db/events/data/tmp/job-1.parquet", "size": 1024}
+  ],
+  "skipped": [
+    {"path": "s3://lake/db/events/data/tmp/job-2.parquet", "reason": "within_grace_period"}
+  ],
+  "failed": []
+}
+```
 
-### 3.2 cleanup_old_metadata
+### 4.2 cleanup_old_metadata 场景
+
+当前 metadata 为 `v0005.metadata.json`。metadata log 保护 `v0004.metadata.json` 和 `v0003.metadata.json`。
+调用方传 `retain_last => 2`，因此最近两个版本 `v0005`、`v0004` 也受保护。
+
+对象存储实际文件：
+
+```text
+metadata/v0005.metadata.json       # current, keep
+metadata/v0004.metadata.json       # metadata log + retain_last, keep
+metadata/v0003.metadata.json       # metadata log, keep
+metadata/v0002.metadata.json       # old, UUID matches, mtime 20 days ago, delete
+metadata/v0001.metadata.json       # old, mtime 1 day ago, skip
+metadata/failed-write.metadata.json # not protected, parse fails, skip
+metadata/manifest-list-1.avro       # not table metadata json, ignore
+```
+
+调用：
 
 ```sql
 SELECT iceberg_catalog.cleanup_old_metadata(
     p_namespace => 'db',
     p_table => 'events',
     older_than => interval '7 days',
-    retain_last => 100,
-    dry_run => true,
+    retain_last => 2,
+    dry_run => false,
     verbose => true
 );
 ```
 
-目标场景：
+返回示例：
 
-- 当前 metadata json 必须保留。
-- metadata log / previous metadata log 可达的 metadata json 必须保留。
-- 最近 `retain_last` 个 metadata json 必须保留，默认 100；调用方可显式传入。
-- 超过安全窗口、解析成功、table UUID 匹配且不在保护集合中的旧 metadata json 才能删除。
+```json
+{
+  "operation": "cleanup_old_metadata",
+  "dry_run": false,
+  "scope": "table_metadata_json_only",
+  "retain_last": 2,
+  "candidate_file_count": 1,
+  "deleted_file_count": 1,
+  "skipped_file_count": 2,
+  "removed": [
+    {"path": "s3://lake/db/events/metadata/v0002.metadata.json", "size": 4096}
+  ],
+  "skipped": [
+    {"path": "s3://lake/db/events/metadata/v0001.metadata.json", "reason": "within_grace_period"},
+    {"path": "s3://lake/db/events/metadata/failed-write.metadata.json", "reason": "metadata_parse_failed"}
+  ],
+  "failed": []
+}
+```
 
-约束场景：
+### 4.3 vacuum_index 场景
 
-- 不删除 manifest-list、manifest、statistics Puffin、index registry Puffin、index segment artifact、data/delete files。
-- unknown metadata json 必须解析并校验 `table-uuid`；解析失败或 UUID 不匹配时跳过或请求级 fail closed。
+当前 retained snapshots 为 `1003`、`1004`，它们的 statistics-files 指向 registry：
 
-### 3.3 vacuum_index
+```text
+indices/index-metadata-1003-live.puffin
+indices/index-metadata-1004-live.puffin
+```
+
+registry 中 live segment：
+
+```text
+indices/vec_idx/snap1003/seg-a.puffin
+indices/vec_idx/snap1004/seg-b.puffin
+```
+
+对象存储实际文件：
+
+```text
+indices/index-metadata-1004-live.puffin       # live registry, keep
+indices/vec_idx/snap1004/seg-b.puffin         # live segment, keep
+indices/vec_idx/dropped/seg-old.puffin        # not live, mtime 30 days ago, delete
+indices/vec_idx/building/seg-new.puffin       # not live, mtime 1 hour ago, skip
+indices/other_idx/orphan.puffin               # index_name=vec_idx 时归属不明或不匹配, skip
+```
+
+调用：
 
 ```sql
 SELECT iceberg_catalog.vacuum_index(
     p_namespace => 'db',
     p_table => 'events',
-    index_name => NULL,
+    index_name => 'vec_idx',
     older_than => interval '7 days',
-    dry_run => true,
+    dry_run => false,
     verbose => true
 );
 ```
 
-目标场景：
+返回示例：
 
-- drop index 后 registry entry 已变为 Dropped，但历史 snapshot 仍可能引用旧 registry / segment。
-- `vacuum_index` 必须保留所有 retained snapshot、branch、tag、reference 可达的 index registry 和 segment。
-- 超过安全窗口、路径安全、Puffin 类型合理、归属本表且不在 live set 中的 index 文件才可删除。
-
-约束场景：
-
-- 指定 `index_name` 时，只删除能证明属于该逻辑索引的文件。
-- 无法归属到指定 index 的 orphan 文件必须进入 `skipped`。
-- `index_name IS NULL` 时可以清理所有能证明属于本表且不 live 的 index 文件。
-
-## 4. 端到端链路
-
-### 4.1 Catalog 通用步骤
-
-1. SQL 函数接收 `p_namespace` / `p_table`、`older_than`、`dry_run`、`verbose` 等参数。
-2. Catalog 从 `iceberg_catalog.tables_internal` 查询表记录。
-3. Catalog 校验调用权限和表存在性。
-4. Catalog 构造 bridge storage handle 所需的 FileIO 配置，必须与建表/扫描路径一致。
-5. Catalog 调用对应 bridge C ABI。
-6. Catalog 将 bridge 返回 JSON 转为 `jsonb` 返回。
-7. 请求级错误抛 SQL ERROR；文件级删除失败保留在 JSON 的 `failed` 中。
-
-Catalog 不做：
-
-- 不解析 Iceberg manifest。
-- 不解析 index registry Puffin。
-- 不扫描对象存储目录。
-- 不更新 `metadata_location`。
-
-### 4.2 bridge 通用步骤
-
-1. C ABI 校验 storage handle、`metadata_location`、table ident、参数范围。
-2. bridge 将请求转换成 `iceberg-index-abi` 的 metadata-location request。
-3. bridge 调用 SDK 同步入口。
-4. bridge 不在本层实现清理算法；算法属于 `iceberg-index` SDK。
-5. bridge 将 SDK JSON 字符串透传为 `IcebergBridgeString`。
-
-### 4.3 SDK 通用步骤
-
-1. 用 `metadata_location` 和 FileIO 加载固定版本 Iceberg table。
-2. 从 table metadata 读取 `table_uuid`、`table_location`、snapshot、manifest、statistics-files 等信息。
-3. 构建 protected/live set。
-4. 扫描接口允许的物理目录。
-5. 计算 candidate set。
-6. 应用安全窗口、路径、URI、UUID、Puffin sanity 等保护规则。
-7. `dry_run=true` 只返回候选和统计。
-8. `dry_run=false` 对每个候选执行删除前 re-stat，复查安全窗口，再 best-effort 删除。
-9. NotFound 按幂等成功处理，但 JSON 中记录 `reason=not_found`。
-
-## 5. 接口与实现细节
-
-### 5.1 remove_orphan_files
-
-SQL 形态：
-
-```sql
-SELECT iceberg_catalog.remove_orphan_files(
-    p_namespace text,
-    p_table text,
-    older_than interval DEFAULT interval '7 days',
-    dry_run boolean DEFAULT true,
-    verbose boolean DEFAULT false
-);
+```json
+{
+  "operation": "vacuum_index",
+  "dry_run": false,
+  "scope": "index_files",
+  "index_name": "vec_idx",
+  "live_file_count": 4,
+  "actual_file_count": 5,
+  "candidate_file_count": 1,
+  "deleted_file_count": 1,
+  "skipped_file_count": 2,
+  "removed": [
+    {"path": "s3://lake/db/events/indices/vec_idx/dropped/seg-old.puffin", "size": 8192}
+  ],
+  "skipped": [
+    {"path": "s3://lake/db/events/indices/vec_idx/building/seg-new.puffin", "reason": "within_grace_period"},
+    {"path": "s3://lake/db/events/indices/other_idx/orphan.puffin", "reason": "index_name_mismatch_or_unknown_owner"}
+  ],
+  "failed": []
+}
 ```
+
+## 5. 端到端链路
+
+### 5.1 remove_orphan_files 流程
+
+```mermaid
+flowchart TD
+  A["Catalog SQL remove_orphan_files"] --> B["Catalog 查询 tables_internal"]
+  B --> C["Catalog 构造 storage handle 和 table ident"]
+  C --> D["bridge C ABI: iceberg_bridge_table_remove_orphan_data_files"]
+  D --> E["SDK 加载 metadata_location 对应 Table"]
+  E --> F["SDK 校验 metadata/*.metadata.json table UUID"]
+  F --> G["SDK 遍历所有有效 snapshot manifest，生成 referenced_data_files"]
+  G --> H["SDK 扫描 table_location/data，生成 actual_data_files"]
+  H --> I["candidate = actual - referenced"]
+  I --> J["安全窗口、URI、mtime 校验"]
+  J --> K{"dry_run?"}
+  K -- true --> L["返回 candidates JSON"]
+  K -- false --> M["删除前 re-stat 并 best-effort delete"]
+  M --> N["返回 removed/skipped/failed JSON"]
+```
+
+该接口的 protected 依据来自当前 metadata 中所有有效 snapshots 的 manifest 引用集合。它只扫描 `data/`。
+
+### 5.2 cleanup_old_metadata 流程
+
+```mermaid
+flowchart TD
+  A["Catalog SQL cleanup_old_metadata"] --> B["Catalog 查询 tables_internal"]
+  B --> C["bridge C ABI: iceberg_bridge_table_cleanup_old_metadata"]
+  C --> D["SDK 加载当前 metadata_location"]
+  D --> E["读取当前 metadata 的 metadata-log / previous-metadata-log"]
+  E --> F["扫描 metadata/*.metadata.json"]
+  F --> G["构建 protected_metadata_files: current + log + retain_last + grace"]
+  G --> H["候选 = 扫描到的 table metadata json - protected"]
+  H --> I["解析候选 TableMetadata 并校验 table UUID"]
+  I --> J{"dry_run?"}
+  J -- true --> K["返回 candidates JSON"]
+  J -- false --> L["删除前 re-stat 并 best-effort delete"]
+  L --> M["返回 removed/skipped/failed JSON"]
+```
+
+metadata log / previous metadata log 从当前 `metadata_location` 指向的 Iceberg `TableMetadata` 内容中读取；不是从
+Catalog 表读取。
+
+### 5.3 vacuum_index 流程
+
+```mermaid
+flowchart TD
+  A["Catalog SQL vacuum_index"] --> B["Catalog 查询 tables_internal"]
+  B --> C["bridge C ABI: iceberg_index_rs_vacuum_index_by_metadata"]
+  C --> D["SDK 加载当前 metadata_location"]
+  D --> E["计算 retained snapshots: current + time-travel + branch/tag/reference"]
+  E --> F["读取 retained snapshots 的 statistics-files"]
+  F --> G["读取 index registry Puffin"]
+  G --> H["生成 live_index_files: registry + segments"]
+  H --> I["扫描 indices/ 和 confirmed registry Puffin，生成 actual_index_files"]
+  I --> J["candidate = actual_index_files - live_index_files"]
+  J --> K["安全窗口、Puffin、table UUID、index_name 校验"]
+  K --> L{"dry_run?"}
+  L -- true --> M["返回 candidates JSON"]
+  L -- false --> N["删除前 re-stat 并 best-effort delete"]
+  N --> O["返回 removed/skipped/failed JSON"]
+```
+
+retained snapshot 的作用不是“生成 registry”，而是确定哪些历史 snapshot 仍可被查询或回滚。SDK 需要读取这些 snapshot
+可达的 registry，从 registry 中标记必须保留的 registry Puffin 和 segment artifact，形成 `live_index_files`。
+
+## 6. 接口与实现细节
+
+### 6.1 remove_orphan_files
 
 bridge C ABI：
 
@@ -230,7 +377,7 @@ IcebergBridgeStatus iceberg_bridge_table_remove_orphan_data_files(
     IcebergBridgeError **err);
 ```
 
-SDK request：
+SDK 接口：
 
 ```rust
 pub struct MetadataRemoveOrphanFilesRequest {
@@ -241,53 +388,25 @@ pub struct MetadataRemoveOrphanFilesRequest {
     pub grace_period_seconds: u64,
     pub file_io_config_json: String,
 }
+
+impl IndexEngine {
+    pub fn remove_orphan_files_by_metadata(
+        &self,
+        req: &MetadataRemoveOrphanFilesRequest,
+    ) -> Result<String>;
+}
 ```
 
-SDK 实现步骤：
+实现要求：
 
-1. 加载 `metadata_location` 指向的 table metadata。
-2. 读取 `table_location` 和 `table_uuid`。
-3. 扫描 `<table_location>/metadata/` 下所有 `*.metadata.json`，校验 `table-uuid` 均等于当前表 UUID。
-4. 遍历当前 table metadata 中所有 snapshots。
-5. 对每个 snapshot 读取 manifest-list 和 manifest。
-6. 收集所有被任意有效 snapshot 引用的 data/delete file URI，规范化为 table-relative path。
-7. 只扫描 `<table_location>/data/`。
-8. `actual_data_files - referenced_data_files` 得到初始 orphan set。
-9. 对每个候选 stat，mtime 必须早于 `now - grace_period_seconds`。
-10. `dry_run=true` 返回候选。
-11. `dry_run=false` 删除前再次 stat；mtime 进入安全窗口、mtime 缺失或 stat 无法判断时加入 `skipped`。
-12. 删除成功加入 `removed`；NotFound 加入 `removed` 且 `reason=not_found`；其他删除失败加入 `failed`。
+- 收集所有有效 snapshot 引用的 data/delete files。
+- 只扫描 `{table_location}/data/`。
+- `actual - referenced` 后再做安全窗口和 URI 校验。
+- 不重新加载最新 metadata；依赖 7 天安全窗口和删除前 re-stat 保护并发写入。
 
-保护规则：
+### 6.2 cleanup_old_metadata
 
-- 只允许删除 `{table_location}/data/` 下文件。
-- metadata UUID 校验失败时请求级 fail closed。
-- URI 必须规范化后比较 scheme、authority/bucket、path，不能用字符串前缀代替。
-- 不认识的 scheme、包含 `..`、越界路径、mtime 缺失、路径归属不明，必须跳过。
-
-### 5.2 cleanup_old_metadata
-
-SQL 形态：
-
-```sql
-SELECT iceberg_catalog.cleanup_old_metadata(
-    p_namespace text,
-    p_table text,
-    older_than interval DEFAULT interval '7 days',
-    retain_last integer DEFAULT 100,
-    dry_run boolean DEFAULT true,
-    verbose boolean DEFAULT false
-);
-```
-
-`retain_last` 约束：
-
-- 用户可传参，默认 100。
-- 必须为正整数。
-- 表示按 metadata 版本顺序保留最近 N 个 table metadata json。
-- `retain_last` 只保护 table metadata json，不保护 manifest、manifest-list 或 Puffin。
-
-bridge C ABI 建议：
+bridge C ABI：
 
 ```c
 IcebergBridgeStatus iceberg_bridge_table_cleanup_old_metadata(
@@ -301,46 +420,39 @@ IcebergBridgeStatus iceberg_bridge_table_cleanup_old_metadata(
     IcebergBridgeError **err);
 ```
 
-SDK 实现步骤：
+SDK 接口：
 
-1. 加载当前 `metadata_location`。
-2. 获取 `table_uuid`、`table_location`。
-3. 构建 `protected_metadata_files`：
-   - 当前 `metadata_location`。
-   - 当前 metadata log / previous metadata log 引用的 metadata json。
-   - `<table_location>/metadata/` 下按版本号或 last_modified 排序后的最近 `retain_last` 个 metadata json。
-   - 安全窗口内的 metadata json。
-4. 扫描 `<table_location>/metadata/` 下 table metadata json 文件。
-5. 文件在 protected set 中则跳过。
-6. unknown metadata json 必须读取内容并解析 Iceberg `TableMetadata`。
-7. 校验 `table-uuid` 等于当前表 UUID。
-8. 解析失败、UUID 不匹配、路径越界、mtime 缺失或安全窗口内，加入 `skipped`。
-9. `dry_run=true` 返回候选。
-10. `dry_run=false` 删除前 re-stat 并重复安全窗口检查，再 best-effort 删除。
+```rust
+pub struct MetadataCleanupOldMetadataRequest {
+    pub table_namespace: Vec<String>,
+    pub table_name: String,
+    pub metadata_location: String,
+    pub retain_last: u64,
+    pub dry_run: bool,
+    pub grace_period_seconds: u64,
+    pub file_io_config_json: String,
+}
 
-保护规则：
-
-- 不清理 manifest-list、manifest、statistics Puffin、index registry Puffin、index segment artifact。
-- 不清理任何当前 metadata log 可达的 metadata json。
-- 不清理最近 `retain_last` 个 metadata json。
-- 不能解析为当前表 metadata 的文件不得删除。
-
-### 5.3 vacuum_index
-
-SQL 形态：
-
-```sql
-SELECT iceberg_catalog.vacuum_index(
-    p_namespace text,
-    p_table text,
-    index_name text DEFAULT NULL,
-    older_than interval DEFAULT interval '7 days',
-    dry_run boolean DEFAULT true,
-    verbose boolean DEFAULT false
-);
+impl IndexEngine {
+    pub fn cleanup_old_metadata_by_metadata(
+        &self,
+        req: &MetadataCleanupOldMetadataRequest,
+    ) -> Result<String>;
+}
 ```
 
-bridge C ABI 建议：
+实现要求：
+
+- 从当前 `TableMetadata` 读取 metadata log / previous metadata log。
+- 扫描 `{table_location}/metadata/*.metadata.json`。
+- 构建 `protected_metadata_files = current + metadata log + previous metadata log + retain_last + grace_window`。
+- “待确认 metadata json”指扫描到但不在 `protected_metadata_files` 中的 metadata json。
+- 待确认 metadata json 必须解析为 Iceberg `TableMetadata` 并校验 `table-uuid`。
+- 只删除 table metadata json，不删除 manifest、manifest-list、Puffin、data/delete files。
+
+### 6.3 vacuum_index
+
+bridge C ABI：
 
 ```c
 IcebergBridgeStatus iceberg_index_rs_vacuum_index_by_metadata(
@@ -350,7 +462,7 @@ IcebergBridgeStatus iceberg_index_rs_vacuum_index_by_metadata(
     IcebergBridgeError **err);
 ```
 
-SDK request 建议：
+SDK 接口：
 
 ```rust
 pub struct MetadataVacuumIndexRequest {
@@ -362,67 +474,24 @@ pub struct MetadataVacuumIndexRequest {
     pub grace_period_seconds: u64,
     pub file_io_config_json: String,
 }
+
+impl IndexEngine {
+    pub fn vacuum_index_by_metadata(
+        &self,
+        req: &MetadataVacuumIndexRequest,
+    ) -> Result<String>;
+}
 ```
 
-SDK 实现采用 mark-and-sweep：
+实现要求：
 
-1. 加载 `metadata_location` 指向的 table metadata。
-2. 计算 retained snapshot 集合：
-   - 当前 snapshot。
-   - 未被过期策略排除的历史 snapshot。
-   - branch/tag/reference 可达 snapshot。
-3. 对 retained snapshot 读取 `statistics-files.statistics_path`。
-4. 只把包含本项目 index registry blob type 且 table UUID 匹配的 Puffin 作为 registry Puffin。
-5. 读取 registry，收集 registry 自身路径和所有 segment artifact 路径，得到 `live_index_files`。
-6. 扫描 `{table_location}/indices/`，并结合 statistics-files 中可确认的 registry Puffin，得到 `actual_index_files`。
-7. 计算 `candidate_index_files = actual_index_files - live_index_files`。
-8. 对 candidate 应用安全窗口、URI root、Puffin magic/footer、registry table UUID、index_name 过滤。
-9. `dry_run=true` 返回候选。
-10. `dry_run=false` 删除前 re-stat，复查保护规则，再 best-effort 删除。
-
-三个集合定义：
-
-- `live_index_files`：仍被 retained snapshot / branch / tag / reference / registry 引用，必须保留。
-- `actual_index_files`：对象存储中实际存在且可能属于该表索引的文件。
-- `candidate_index_files`：`actual_index_files - live_index_files` 后仍需继续通过保护规则的候选。
-
-保护规则：
-
-- 当前 snapshot 的 registry Puffin 和 segment artifact 不得删除。
-- 任意 retained snapshot 可达的 registry Puffin 和 segment artifact 不得删除。
-- `index_name` 指定时，无法证明属于该 index 的文件不得删除。
-- Puffin sanity check 失败时不得删除。
-- table UUID / registry ownership 不匹配时请求级 fail closed 或文件级 skipped。
-
-Puffin sanity check 至少包括：
-
-- 文件扩展名或路径布局符合本项目索引文件约定。
-- Puffin magic/footer 可读。
-- registry Puffin 必须包含 index registry blob type。
-- registry table UUID 必须等于当前 table UUID。
-- segment artifact 必须能从 live/dropped registry entry 或 artifact metadata 中证明归属。
-
-## 6. URI 与删除保护规则
-
-所有会删除物理文件的接口都必须执行以下通用规则：
-
-- 将输入路径和候选路径解析为规范 URI。
-- 分别比较 scheme、authority/bucket、normalized path。
-- table root 比较必须使用带目录分隔符的 normalized prefix。
-- 禁止 `..`、空 path segment、模糊重复 slash、无法规范化的 URI。
-- cleanup root 必须符合接口范围：
-  - `remove_orphan_files`: `{table_location}/data/`
-  - `cleanup_old_metadata`: `{table_location}/metadata/` 中 table metadata json
-  - `vacuum_index`: `{table_location}/indices/` 和 confirmed index registry Puffin
-- 删除前必须 re-stat。
-- mtime 缺失或无法判断时不得删除。
-- NotFound 按幂等成功处理。
-- table UUID 混用、table_location 重叠、候选归属其他表时 fail closed。
-
-当前不强制实现 `table_location` 全局唯一性和父子包含关系检查；后续应在 `create_table` 中补充：
-
-- 不同表的 `table_location` 不能完全相同。
-- 不同表的 `table_location` 不能存在父子包含关系。
+- retained snapshots 用于确定 `live_index_files`。
+- 从 retained snapshots 的 `statistics-files.statistics_path` 找到 registry Puffin。
+- registry Puffin 必须包含本项目 index registry blob type，且 table UUID 匹配。
+- `live_index_files` 包含 registry Puffin 自身和 registry 中所有 live segment artifact。
+- `actual_index_files` 来自 `{table_location}/indices/` 和 confirmed registry Puffin。
+- `candidate_index_files = actual_index_files - live_index_files`。
+- candidate 必须再经过安全窗口、Puffin sanity、table UUID 和 `index_name` 校验。
 
 ## 7. 返回 JSON 规范
 
@@ -456,108 +525,38 @@ Puffin sanity check 至少包括：
 
 - `new_metadata_location` 第一阶段固定为 `null`。
 - `failed` 始终返回。
-- `candidates`、`removed`、`skipped` 仅在 `verbose=true` 或测试模式下返回完整明细；默认可只返回统计。
-- 请求级错误使用 SQL ERROR / C ABI error。
-- 文件级删除失败放入 `failed`，不回滚已完成删除。
+- `candidates`、`removed`、`skipped` 仅在 `verbose=true` 或测试模式下返回完整明细。
+- 文件级失败不回滚已完成删除。
 
-## 8. Catalog 组合入口
+## 8. 测试计划
 
-第一阶段可以设计但不要求立即实现：
+- 本地 FileIO 回归覆盖三个接口的 dry-run 和 execute。
+- S3 集成测试通过环境变量显式开启，未配置时跳过。
+- 所有接口覆盖默认 7 天安全窗口。
+- `remove_orphan_files` 覆盖 referenced、old orphan、new orphan、metadata/indices 目录忽略。
+- `cleanup_old_metadata` 覆盖 current、metadata log、`retain_last`、安全窗口、解析失败、UUID 不匹配。
+- `vacuum_index` 覆盖 retained snapshot 保护、branch/tag/reference 保护、`index_name` 过滤、Puffin sanity check。
+- NotFound 删除按幂等成功断言。
+- 路径越界、URI normalize 失败、mtime 缺失必须进入 skipped 或请求级错误。
 
-```sql
-SELECT iceberg_catalog.gc_table(
-    p_namespace text,
-    p_table text,
-    expire_snapshots boolean DEFAULT false,
-    remove_orphan_files boolean DEFAULT true,
-    cleanup_old_metadata boolean DEFAULT false,
-    vacuum_index boolean DEFAULT false,
-    older_than interval DEFAULT interval '7 days',
-    retain_last integer DEFAULT 100,
-    dry_run boolean DEFAULT true,
-    verbose boolean DEFAULT false
-);
-```
+## 9. 开发清单
 
-组合入口只在 Catalog 层同步编排独立 SQL/C ABI，不要求 bridge 或 SDK 增加组合接口。
+### 9.1 SDK
 
-执行顺序建议：
+- 在 `iceberg-index` 实现三个 metadata-location request 和同步入口。
+- 核心逻辑放在 `iceberg-index-iceberg`，bridge-facing API 放在 `iceberg-index-abi`。
+- 返回 JSON 字段必须与本文一致。
 
-```text
-expire_snapshots -> remove_orphan_files -> cleanup_old_metadata -> vacuum_index
-```
+### 9.2 bridge
 
-第一阶段中 `expire_snapshots=false` 是默认值。若第二阶段实现后启用 `expire_snapshots`，组合入口必须遵守第二阶段文档的
-CAS 和 delete-after-CAS 规则。
+- 暴露三个 C ABI。
+- bridge 不保留目录扫描或删除算法。
+- bridge 只做参数转换、storage config 传递、错误映射和 JSON 字符串返回。
 
-返回 JSON 使用固定 step 状态：
-
-- `ok`
-- `partial_failure`
-- `request_error`
-- `skipped`
-- `skipped_due_to_failed_step`
-
-## 9. 测试计划
-
-### 9.1 本地回归
-
-- 使用本地 FileIO / 对象存储构造真实 Iceberg metadata。
-- 覆盖 `dry_run=true` 和 `dry_run=false`。
-- 覆盖默认 7 天安全窗口。
-- 通过缩短 `older_than` 或修改本地文件 mtime 构造超过安全窗口的文件。
-- 覆盖 NotFound 幂等。
-- 覆盖路径越界、mtime 缺失、UUID 不匹配、Puffin sanity check 失败。
-
-### 9.2 S3 集成
-
-S3 测试通过环境变量显式开启，未配置时跳过，不影响本地回归。至少需要：
-
-- endpoint
-- bucket
-- access key
-- secret key
-- region
-- path-style 配置
-
-S3 测试必须覆盖：
-
-- URI normalize。
-- scheme / authority / bucket 比较。
-- prefix 包含关系。
-- stat / mtime。
-- NotFound 幂等。
-- dry-run 和 execute。
-
-### 9.3 接口级测试
-
-- `remove_orphan_files` 只删除 `data/` 下 orphan data/delete files。
-- `cleanup_old_metadata` 保护当前 metadata、metadata log、最近 `retain_last` 个 metadata json。
-- `vacuum_index` 保护 retained snapshot / branch / tag / reference 可达的 registry 和 segment。
-- 组合入口 disabled step 返回 `skipped`。
-- 文件级失败返回 `partial_failure`，请求级失败返回 `request_error`。
-
-## 10. 开发清单
-
-### 10.1 SDK
-
-- 在 `iceberg-index` 实现 `remove_orphan_files`。
-- 在 `iceberg-index` 实现 `cleanup_old_metadata`。
-- 在 `iceberg-index` 实现 `vacuum_index`。
-- 所有实现都必须接收 `metadata_location` 和 FileIO config。
-- 所有实现都必须返回统一 JSON。
-
-### 10.2 bridge
-
-- 暴露 `iceberg_bridge_table_remove_orphan_data_files`。
-- 暴露 `iceberg_bridge_table_cleanup_old_metadata`。
-- 暴露 `iceberg_index_rs_vacuum_index_by_metadata`。
-- bridge 只做 C ABI 参数转换和错误映射，不实现核心清理算法。
-
-### 10.3 Catalog
+### 9.3 Catalog
 
 - 暴露三个 SQL 函数。
-- 从 `tables_internal` 查表。
+- 从 `tables_internal` 查询表。
 - 构造 bridge storage handle。
 - 返回 jsonb。
 - 不新增维护任务表或队列。
