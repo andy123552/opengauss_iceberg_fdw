@@ -24,8 +24,7 @@ metadata pointer 的事实来源。
 
 ## 2. 实现阶段划分
 
-当前开发按能力风险拆成两个阶段。后续如果用户要求“实现第一阶段任务”，默认只实现第一阶段范围，
-不要进入第二阶段的 `expire_snapshots` metadata rewrite / CAS 发布逻辑。
+当前开发按能力风险拆成两个阶段。
 
 第一阶段：目录扫描型维护接口，不修改 Iceberg table 的当前 `metadata_location` 指针。
 
