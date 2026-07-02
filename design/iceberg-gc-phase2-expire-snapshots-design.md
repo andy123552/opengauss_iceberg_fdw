@@ -280,7 +280,60 @@ flowchart TD
 
 ## 6. 接口与实现细节
 
-### 6.1 prepare_expire_snapshots
+### 6.1 Catalog SQL 实现
+
+SQL 入口：
+
+`sql
+SELECT iceberg_catalog.expire_snapshots(
+    p_namespace text,
+    p_table text,
+    older_than interval DEFAULT interval '7 days',
+    retain_last integer DEFAULT 1,
+    snapshot_ids bigint[] DEFAULT NULL,
+    dry_run boolean DEFAULT true,
+    delete_files boolean DEFAULT true,
+    include_index boolean DEFAULT false,
+    verbose boolean DEFAULT false
+) RETURNS jsonb;
+`
+
+Catalog 是该接口的编排者，处理顺序必须固定：
+
+1. 校验 p_namespace、p_table 非空，older_than 大于 0，
+etain_last > 0。
+2. 从 iceberg_catalog.tables_internal 按 namespace/table 读取当前表记录，得到 base_metadata_location、	able_uuid、	able_location、current_snapshot_id。
+3. 打开 bridge storage handle，并构造 table ident。
+4. 调用 bridge iceberg_bridge_table_prepare_expire_snapshots。
+5. 如果 dry_run=true：
+   - prepare 只返回 expired/retained 摘要和候选统计。
+   - Catalog 不执行 CAS，不调用 delete-after-CAS，不调用
+acuum_index。
+   - 直接把 prepare JSON 转成 jsonb 返回。
+6. 如果 dry_run=false 且 prepare 返回 no-op：
+   - Catalog 不执行 CAS。
+   - 不删除物理文件。
+   - 返回 no-op JSON。
+7. 如果 dry_run=false 且 prepare 返回
+ew_metadata_location：
+   - 在同一 SQL 事务中执行 CAS：WHERE metadata_location = base_metadata_location。
+   - CAS 更新行数必须为 1。
+   - CAS 更新 0 行表示并发提交冲突，返回 request-level error，不调用 delete-after-CAS。
+8. CAS 成功后：
+   - delete_files=false 时跳过物理删除。
+   - delete_files=true 时调用 bridge iceberg_bridge_table_delete_expired_snapshot_files，传入 base_metadata_location 和
+ew_metadata_location。
+9. 如果 include_index=true 且 expire step 已成功发布或 no-op 成功，Catalog 再组合调用
+acuum_index；该调用属于组合 step，不改变 expire_snapshots 的底层删除范围。
+10. 汇总 prepare、CAS、delete-files、可选 vacuum-index 的结果并返回 jsonb。
+
+Catalog 不做：
+
+- 不直接解析 manifest、manifest-list 或 Puffin。
+- 不直接删除对象存储文件。
+- 不把 prepare 返回的候选文件列表作为删除授权。
+
+### 6.2 prepare_expire_snapshots
 
 bridge C ABI：
 
@@ -325,7 +378,7 @@ impl IndexEngine {
 - execute 写 new metadata，但不发布 pointer。
 - expired set 为空时返回 no-op，Catalog 不执行 CAS。
 
-### 6.2 Catalog CAS
+### 6.3 Catalog CAS
 
 CAS SQL 必须等价于：
 
@@ -345,7 +398,7 @@ UPDATE iceberg_catalog.tables_internal
 - CAS 失败不删除物理文件。
 - CAS 失败留下的未发布 metadata 由 `cleanup_old_metadata` 后续清理。
 
-### 6.3 delete_expired_snapshot_files
+### 6.4 delete_expired_snapshot_files
 
 bridge C ABI：
 
