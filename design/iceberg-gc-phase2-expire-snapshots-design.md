@@ -302,7 +302,7 @@ Catalog 是该接口的编排者，处理顺序必须固定：
 
 1. 校验 p_namespace、p_table 非空，older_than 大于 0，
 etain_last > 0。
-2. 从 iceberg_catalog.tables_internal 按 namespace/table 读取当前表记录，得到 base_metadata_location、	able_uuid、	able_location、current_snapshot_id。
+2. 从 `iceberg_catalog.tables_internal` 按 namespace/table 读取当前表记录，得到 base_metadata_location、`table_uuid`、`table_location`、current_snapshot_id。
 3. 打开 bridge storage handle，并构造 table ident。
 4. 调用 bridge iceberg_bridge_table_prepare_expire_snapshots。
 5. 如果 dry_run=true：
@@ -383,7 +383,7 @@ impl IndexEngine {
 CAS SQL 必须等价于：
 
 ```sql
-UPDATE iceberg_catalog.tables_internal
+UPDATE `iceberg_catalog.tables_internal`
    SET metadata_location = $new_metadata_location,
        current_snapshot_id = $new_current_snapshot_id
  WHERE namespace = $namespace
