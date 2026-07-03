@@ -6,20 +6,33 @@ openGauss Iceberg 集成通过 ``iceberg_catalog.tables_internal`.metadata_locat
 metadata pointer。FDW 只负责查询和扫描，不参与表维护命令。GC / 维护入口统一放在
 `iceberg_catalog` 扩展中，由 Catalog SQL 函数同步调用 bridge C ABI，再由 bridge 调用 Rust SDK。
 
-第一阶段只解决“不需要改写 Iceberg metadata.json”的清理问题：
+Iceberg 表在正常查询路径中只通过 metadata 引用文件；对象存储中的物理文件并不会因为失去引用而自动删除。
+以下场景会产生需要维护接口清理的残留文件：
 
-- 写入任务失败、取消或进程崩溃后，可能留下未被任何 Iceberg metadata 引用的 data/delete、manifest、
-  manifest-list 或 statistics 文件。
-- 多次提交会积累旧 table metadata json；这些文件不能混在 data orphan cleanup 中处理。
-- drop/rebuild index 只应更新索引 registry，不能立即物理删除历史查询仍可能依赖的 index registry / segment 文件。
+- 写入任务已经写出 data/delete 文件、manifest、manifest-list 或 statistics 文件，但在提交 metadata 前失败、
+  取消或进程崩溃。这些文件从未进入任何已发布 metadata 的引用链，只能通过目录扫描发现。
+- 多次提交、索引发布或表属性变更会产生新的 table metadata json。旧 metadata json 需要按 metadata log、
+  current pointer 和 `retain_last` 规则保留，不能与普通 data orphan 文件用同一套判断规则处理。
+- index drop/rebuild 或索引构建失败可能留下 index registry Puffin 和 index segment artifact。索引文件需要保留
+  历史 snapshot / branch / tag / reference 可达性，不能由通用 orphan cleanup 根据“当前 metadata 不引用”直接删除。
 
-第一阶段接口全部是目录扫描型维护动作。它们不会生成新的 Iceberg metadata，不会更新
-`tables_internal.metadata_location`，也不会执行 Catalog CAS。
+因此第一阶段拆成三个独立接口：
+
+- `remove_orphan_files` 清理从未被任何有效 metadata 引用、或已经不被任何有效 metadata 引用且满足安全窗口的普通孤儿文件，
+  覆盖 data/delete、manifest、manifest-list 和 Iceberg statistics orphan。
+- `cleanup_old_metadata` 只清理旧 table metadata json。它保护 current metadata、metadata log、previous metadata log
+  和最近 `retain_last` 个 metadata json，避免误删仍可用于回滚、诊断或历史兼容的 metadata。
+- `vacuum_index` 只清理本项目索引体系的 registry Puffin 和 segment artifact。它基于 retained snapshot / branch / tag /
+  reference 可达性计算 `live_index_files`，并在删除前做 Puffin、table UUID 和 `index_name` 归属校验。
+
+这三个接口都属于第一阶段，是因为它们只做“目录扫描 + 引用集合比对 + 安全校验 + 物理删除”。它们不会生成新的
+Iceberg metadata，不会更新 `tables_internal.metadata_location`，也不会执行 Catalog CAS。需要改写 metadata、发布新
+metadata pointer 或组合多个维护动作的能力放到第二阶段 `expire_snapshots` 和 Catalog orchestration 中实现。
 
 Iceberg 原生维护中，`expire_snapshots` 用于过期 snapshot 并删除只被过期 snapshot 独占引用的 data/delete、
 manifest、manifest-list、statistics 文件；`remove_orphan_files` 用于清理不被 metadata 引用的孤儿文件，且官方提醒
 retention 过短会误删尚未提交的写入文件。LanceDB OSS 倾向于用 `optimize()` 组合 compaction、cleanup 和索引维护。
-本项目采用 Iceberg 的独立动作语义，并把组合入口留到第二阶段 Catalog orchestration 中设计。
+本项目第一阶段采用 Iceberg 的独立动作语义，先提供可组合的底层维护能力。
 
 ## 2. 接口规格、约束与设计边界
 
@@ -104,6 +117,8 @@ manifest 和 manifest-list 的清理归属分两类：已经进入已发布 meta
 - `protected set`：必须保留的文件集合，例如 current metadata、metadata log、最近 `retain_last` 个 metadata json。
 - `live set`：仍被有效表状态引用的文件集合，通常用于 index vacuum；`live_index_files` 表示 retained snapshot / reference 可达 registry 中仍引用的 index 文件。
 - `actual set`：对象存储目录扫描得到的实际文件集合。
+- `actual_index_files`：`vacuum_index` 使用的实际索引文件集合。它只包含两类文件：一类是从 `{table_location}/indices/` 目录扫描到、并经过路径边界和索引归属校验的索引物理文件；另一类是从当前表 metadata 可达的 `statistics-files` 中解析并确认属于本项目 index registry 的 Puffin 文件。它不是“表目录下所有 `.puffin` 文件”的集合。
+- `confirmed registry Puffin`：已经被当前表 metadata 的 `statistics-files` 引用，并且通过 Puffin 内容或 blob metadata 校验证明是本项目 index registry 的 Puffin 文件。确认条件至少包括：文件路径在当前 `table_location` 内、Puffin 可解析、包含本项目约定的 index registry blob type、table UUID 与当前表一致；当传入 `index_name` 时，还必须能证明 registry 属于该索引或引用该索引。普通 Iceberg statistics Puffin、无法解析的 Puffin、table UUID 不匹配的 Puffin、索引归属不明的 Puffin 都不能作为 confirmed registry Puffin。
 - `candidate set`：`actual set - protected/live set` 后得到的候选集合，仍必须经过安全窗口和归属校验。
 - `retained snapshot`：不会被过期或仍需支持 time travel / branch / tag / reference 查询的 snapshot。
 - `unknown metadata json`：扫描 `{table_location}/metadata/` 后发现、且不在 `protected_metadata_files` 中的 `*.metadata.json` 文件。它可能是旧版本、失败写出的未发布 metadata、其他表误放文件或损坏文件，必须解析并校验 table UUID 后才能进入候选集合。
@@ -569,7 +584,9 @@ impl IndexEngine {
 - 从 retained snapshots 的 `statistics-files.statistics_path` 找到 registry Puffin。
 - registry Puffin 必须包含本项目 index registry blob type，且 table UUID 匹配。
 - `live_index_files` 包含 registry Puffin 自身和 registry 中所有 live segment artifact。
-- `actual_index_files` 来自 `{table_location}/indices/` 和 confirmed registry Puffin。
+- `actual_index_files` 由两部分组成：
+  - 扫描 `{table_location}/indices/` 得到的索引物理文件，包括 index segment artifact 和落在该目录下的 index registry Puffin；这些文件必须通过 URI 边界、Puffin sanity、table UUID、`index_name` 归属校验后才能进入实际集合。
+  - 从当前表 metadata 可达的 `statistics-files.statistics_path` 读取并确认的 index registry Puffin。这里的 confirmed registry Puffin 只表示“已经确认是当前表索引 registry 的 Puffin 文件”，不包括普通 Iceberg statistics Puffin，也不包括仅靠扩展名猜测出来的 Puffin。
 - `candidate_index_files = actual_index_files - live_index_files`。
 - candidate 必须再经过安全窗口、Puffin sanity、table UUID 和 `index_name` 校验。
 
