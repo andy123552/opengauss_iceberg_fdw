@@ -104,6 +104,39 @@ openGauss FDW 现有代码模式。
   相关仓库完成 fetch 最新 upstream 分支、rebase 或 fast-forward 到最新、
   只提交目标改动、并成功 push 到远端仓库后才算完成。除非用户明确要求只做
   本地 commit，否则 local-only commit 不足以结束任务。
+
+## GitHub 提交与 PR 流程
+
+- 涉及 GitHub push、PR、CI 修复或更新 PR 时，默认先检查本机 GitHub CLI：
+  `& 'C:\Program Files\GitHub CLI\gh.exe' auth status -h github.com`。如果 token
+  失效，直接打开授权窗口：
+  `Start-Process powershell -ArgumentList @('-NoExit','-Command','& ''C:\Program Files\GitHub CLI\gh.exe'' auth refresh -h github.com --scopes repo,read:org')`。
+- DataInfraLab 上游仓库通常没有直接写权限。遇到
+  `remote: Write access to repository not granted` 或 403 时，不要反复尝试
+  push 上游；应使用 `andy123552/<repo>` fork 分支提交，并向
+  `DataInfraLab/<repo>` 创建 PR。
+- 物理机 `opengauss-ad` 到 GitHub 的下载和 push 可能不稳定，曾出现 GitHub CLI
+  arm64 下载卡住、`Failed to connect to github.com port 443`、`Operation too slow`
+  等问题。开发和验证仍在物理机完成，但 GitHub 发布优先使用本机 Windows 上的
+  GitHub CLI；必要时把物理机生成的 patch 或单文件内容取回本机，再通过 `gh api`
+  更新 fork 分支。
+- 不要把 GitHub token 放进 remote URL 或命令输出中，例如不要使用
+  `https://x-access-token:<token>@github.com/...` 作为长期 remote，也不要让该 URL
+  出现在日志里。临时 push 需要鉴权时，优先使用 `http.https://github.com/.extraheader`
+  的 Basic header；命令结束后立即删除临时 token 文件，并检查 `git config --list`
+  中没有 `x-access-token` 或 `gho_`。
+- 如果临时 URL 或 token 已经被输出到日志，必须把本机 `gh` token 视为已泄露：
+  先清理物理机仓库的 remote/upstream 配置，再执行 `gh auth refresh` 重新授权。
+- 当物理机网络或 git push 鉴权反复失败，但本机 `gh` 可用时，可以用 GitHub
+  Contents API 更新 fork 分支上的文件：
+  1. 用 `gh api repos/<user>/<repo>/contents/<path> --method GET -F ref=<branch> --jq .sha`
+     获取目标文件 sha。
+  2. 将本地文件 base64 后调用
+     `gh api --method PUT repos/<user>/<repo>/contents/<path> --input <json>`，
+     JSON 包含 `message`、`content`、`sha` 和 `branch`。
+  3. 用 `gh pr view` 和 `gh pr checks` 确认 PR head 与 CI 状态。
+- 更新 PR 的标准收尾：确认 PR head commit、检查 `gh pr checks`，如果 CI 失败先读
+  Actions 日志定位是否由本次修改引入；修复后重新运行本地等价命令，再更新 PR。
 - 开发实现、接口对齐和行为判断所参考的设计文档，只能以项目根仓库 `design/`
   目录第一层的相应设计文档为准。依赖仓库、子仓库或其他目录中的设计文档只能作为
   历史/背景参考，不能覆盖根仓 `design/` 下的主设计文档。
