@@ -208,3 +208,36 @@ openGauss FDW 现有代码模式。
 6. 添加 DML callbacks 和 delta writes 的 transaction integration。
 7. 在基础 managed full-scan path 稳定后，添加 index-backed scan 和
    vector-search/refine integration。
+
+## 常用自动化流程
+
+### 飞书文档 / 模板读取
+
+- 当用户要求“按飞书模板改 PR 描述”“读取飞书文档模板”“查看飞书文档内容”这类操作时，优先走飞书 OpenAPI，不要先依赖浏览器 DOM 抓取。
+- 当前已验证可用的链路是：
+  1. 用本机临时回调监听 `http://127.0.0.1:8765/feishu/callback` 接授权回调。
+  2. 打开飞书 OAuth 授权页，至少申请这些 scope：
+     - 搜索和下载文件：`drive:drive`
+     - 读取 docx 正文：`docx:document:readonly`
+     - 如需读取用户信息或辅助定位，可保留：`auth:user.id:read`
+  3. 用授权回调里的 `code` 调 `https://open.feishu.cn/open-apis/authen/v2/oauth/token` 换 `user_access_token`。
+  4. 如果目标是飞书普通文件模板，例如 `PR_TEMPLATE.md`，先调用 `POST https://open.feishu.cn/open-apis/suite/docs-api/search/object` 用标题搜索真实 `docs_token` 和 `docs_type`。
+  5. 若搜索结果类型是 `file`，使用 `GET https://open.feishu.cn/open-apis/drive/v1/files/{file_token}/download` 下载原始文件内容。
+  6. 若搜索结果类型是 `docx`，使用 `GET https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}` 和 `GET https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/raw_content` 读取标题与正文。
+- 已确认案例：分享链接 `https://my.feishu.cn/file/EC2qbQy3yoefO0x5U8VcEGLfnvd` 对应的是 `file` 类型文档 `PR_TEMPLATE.md`，不能当作 `docx document_id` 直接读取，必须先按 `file` 路径搜索或下载。
+- 浏览器里出现“已屏蔽”并不代表授权失败。只要本机回调文件里收到了新的 `code` 和 `state`，就视为授权成功。
+
+### GitHub 提交 / 更新 PR
+
+- 当用户要求“提交到代码仓”“更新 PR”“提 PR”“同步到 GitHub”时，默认标准是：本地改动整理完成、推送到远端分支成功、PR 已创建或已更新后任务才算结束。
+- 涉及 DataInfraLab 多仓协作时，优先在物理机完成代码开发和验证，在本机 Windows 完成 GitHub 发布动作。
+- 推荐流程：
+  1. 在物理机仓库确认目标分支、最新 upstream、工作区状态和最终 commit。
+  2. 若物理机 `git push` 或 `gh` 网络/鉴权不稳定，使用 `git format-patch -1 --stdout HEAD` 从物理机导出补丁。
+  3. 在本机 Windows 干净 clone 上以对应 parent commit 重放补丁，形成干净单提交。
+  4. 使用本机 `gh` 登录态把分支推到 `andy123552/<repo>` fork。
+  5. 已有 PR 分支更新时，先 `git fetch fork <branch>`，再用 `git push fork HEAD:refs/heads/<branch> --force-with-lease`，避免盲目强推。
+  6. 新 PR 使用本机 `gh pr create`；已有 PR 使用 `gh pr edit` 更新标题和描述。
+- 如果需要批量更新多个仓库 PR，优先把 PR 模板正文先落到本地文件，再统一用 `gh pr edit --body-file <file>` 批量更新，避免手工拼接多段命令时出错。
+- 飞书模板改 PR 的组合链路已经验证可行：飞书 OAuth -> 搜索/下载 `PR_TEMPLATE.md` -> 本机生成 `body-file` -> `gh pr edit`。
+- 以上两类常用流程的仓内共享版 skill 放在项目根目录 `skills/`，本机可执行版放在 `~/.codex/skills/`。更新流程时，优先保持两处内容同步。

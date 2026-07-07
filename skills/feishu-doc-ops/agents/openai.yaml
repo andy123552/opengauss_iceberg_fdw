@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feishu Doc Ops"
+  short_description: "Read Feishu docs and shared markdown templates."
+  default_prompt: "Use this skill to authorize with Feishu, find the real file or document token, and read or download the requested content through OpenAPI."

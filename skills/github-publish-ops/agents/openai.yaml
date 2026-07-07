@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitHub Publish Ops"
+  short_description: "Push validated changes and update GitHub PRs."
+  default_prompt: "Use this skill to publish one or more repositories through local GitHub CLI workflows, including fork pushes, PR creation, and PR updates."
