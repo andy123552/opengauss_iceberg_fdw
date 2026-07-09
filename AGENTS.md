@@ -22,16 +22,20 @@ openGauss FDW 现有代码模式。
 
 ## 本地布局
 
-- 项目根目录：`/home/andy/opengauss_iceberg_fdw`
-- openGauss 源码参考树：`openGauss-server/`
-- 源码参考仓库：
-  `https://github.com/DataInfraLab/openGauss-server-datainfra`
-- 源码克隆说明：`design/source-reference.md`
-- Catalog 源码参考树：`Catalog/`
-- Catalog 源码参考仓库：`https://github.com/HardingHang/Catalog`
-- Catalog 源码参考提交：
-  `8ed555bc4db70e7f1fd2ca5b3722e5dc159d1b57`
-- FDW 扩展骨架：`iceberg_fdw/`
+- 本机根仓只保留项目主仓：`/home/andy/opengauss_iceberg_fdw`
+- 本机只保留主仓自身内容，例如：`design/`、`README.md`、`AGENTS.md`、
+  `iceberg_fdw/`、`tools/`、`skills/`、`docker-compose.yml`
+- 本机不要保留依赖仓工作副本，不要在本机查看、修改、编译或提交依赖仓代码；
+  若本机再次出现 `data_infra/`、`openGauss-server/`、`Catalog/`、
+  `iceberg-rust-bridge/`、`iceberg-rust-datainfra/`、`iceberg-index/`
+  等依赖仓目录，应视为需要清理的冗余副本
+- 所有依赖仓代码检视、开发、编译、测试、提交、push、PR 更新统一在物理机
+  `opengauss-ad` 上完成
+- 物理机主开发根目录：`/data/ad/stack/data_infra`
+- 物理机 bridge 仓：`/data/ad/stack/data_infra/deps/iceberg-rust-bridge`
+- 物理机 rust sdk 仓：`/data/ad/stack/data_infra/deps/iceberg-rust-datainfra`
+- 物理机 index 仓：`/data/ad/stack/data_infra/deps/iceberg-index`
+- 物理机 catalog 仓：`/data/ad/stack/data_infra/plugins/openGauss-Catalog`
 - 运行模式：使用 `docker-compose.yml` 中的 Docker 镜像；默认不要编译
   openGauss 源码树。
 - 项目总览：`README.md`
@@ -93,9 +97,13 @@ openGauss FDW 现有代码模式。
 
 ## 当前开发原则
 
-- 本地 `openGauss-server/` 和 `Catalog/` 仓库是开发参考和集成依赖。
-  `iceberg_fdw/` 应保持可独立构建，同时在 headers、hooks、catalog tables
-  和 runtime behavior 上与这些仓库对齐。
+- 依赖仓只以物理机 `opengauss-ad` 上的工作副本为准。本机根仓不再保留依赖仓
+  checkout，也不能再以本机副本作为代码事实来源。
+- 所有代码检视、实现、编译、测试、提交、push、PR 更新统一在物理机进行；
+  除非用户明确要求处理主仓文档或主仓脚本，本机只用于维护根仓自身内容。
+- 物理机 `openGauss-server`、`Catalog`、`bridge`、`rust sdk`、`index`
+  仓库是开发参考和集成依赖。`iceberg_fdw/` 应保持可独立构建，同时在
+  headers、hooks、catalog tables 和 runtime behavior 上与这些仓库对齐。
 - 开始代码修改前，刷新所有相关依赖仓库到 upstream head，并用具体 revision
   检查结果。不要只依赖之前的“已 pull”消息。对于任务触及的任何依赖仓库，
   在诊断集成失败前，确认 fetched remote tip 和本地 `HEAD` 都匹配目标最新
@@ -107,36 +115,51 @@ openGauss FDW 现有代码模式。
 
 ## GitHub 提交与 PR 流程
 
-- 涉及 GitHub push、PR、CI 修复或更新 PR 时，默认先检查本机 GitHub CLI：
-  `& 'C:\Program Files\GitHub CLI\gh.exe' auth status -h github.com`。如果 token
-  失效，直接打开授权窗口：
-  `Start-Process powershell -ArgumentList @('-NoExit','-Command','& ''C:\Program Files\GitHub CLI\gh.exe'' auth refresh -h github.com --scopes repo,read:org')`。
+- 对当前主仓 `opengauss_iceberg_fdw` 自身内容（例如 `AGENTS.md`、`design/`、
+  `README*`、`tools/`、`skills/`）的修改，默认直接在当前本地 `main` 分支上完成，
+  不要再创建临时 worktree、临时发布分支或 detached HEAD 发布链路。
+- 当前主仓只有用户本人维护，默认目标状态是：本地 `main` 与 GitHub `origin/main`
+  保持同一条提交线、同步前进。除非用户明确要求保留分叉历史，否则不要把主仓改动先提交到
+  其他临时分支，再把远端 `main` 指到另一条历史线上。
+- 当前主仓的标准提交流程：
+  1. 在当前工作目录确认 `git branch --show-current` 为 `main`
+  2. `git fetch origin`
+  3. 如远端有新提交，先在当前 `main` 上执行 `git rebase origin/main`
+  4. 直接在当前仓库修改文件
+  5. 用 `git add` / `git commit` 在当前 `main` 上提交
+  6. 直接执行 `git push origin main`
+- 只有当用户明确要求覆盖远端历史，或已经确认远端 `main` 被错误提交切到错误历史上时，
+  才允许对当前主仓使用 `git push --force-with-lease origin main`；执行前必须先确认
+  要保留的本地 `main` 历史就是正确基线。
+- 如果之前为当前主仓创建过临时 worktree、临时发布分支或只用于提交主仓文档/skill 的
+  辅助分支，在改动已经合回当前 `main` 并成功 push 后，应立即清理，避免后续再次误用。
 - DataInfraLab 上游仓库通常没有直接写权限。遇到
   `remote: Write access to repository not granted` 或 403 时，不要反复尝试
   push 上游；应使用 `andy123552/<repo>` fork 分支提交，并向
   `DataInfraLab/<repo>` 创建 PR。
-- 物理机 `opengauss-ad` 到 GitHub 的下载和 push 可能不稳定，曾出现 GitHub CLI
-  arm64 下载卡住、`Failed to connect to github.com port 443`、`Operation too slow`
-  等问题。开发和验证仍在物理机完成，但 GitHub 发布优先使用本机 Windows 上的
-  GitHub CLI；必要时把物理机生成的 patch 或单文件内容取回本机，再通过 `gh api`
-  更新 fork 分支。
+- GitHub 发布默认也在物理机 `opengauss-ad` 完成。物理机已验证可直接安装
+  `gh`、登录 GitHub、配置 `gh auth setup-git`、推送 fork 分支并更新 PR。
+- 涉及 GitHub push、PR、CI 修复或更新 PR 时，默认先在物理机检查：
+  `export PATH="$HOME/.local/bin:$PATH"; gh auth status -h github.com`
+- 物理机标准发布链路：
+  1. 在目标仓库确认当前分支、上游分支、工作区状态和 `HEAD`
+  2. 如有需要，先 `git fetch origin` / `git fetch fork`
+  3. 提交代码后，用 `git push fork HEAD:refs/heads/<branch>` 更新 fork 分支
+  4. 用 `gh pr view`、`gh pr edit`、`gh pr checks` 查看或更新 PR
+- 如果目标分支已经存在同名本地遗留分支，先保留或改名旧分支，再新建一个跟踪
+  `fork/<branch>` 的本地分支，避免混入历史上重复生成但 SHA 不同的提交链。
 - 不要把 GitHub token 放进 remote URL 或命令输出中，例如不要使用
   `https://x-access-token:<token>@github.com/...` 作为长期 remote，也不要让该 URL
   出现在日志里。临时 push 需要鉴权时，优先使用 `http.https://github.com/.extraheader`
   的 Basic header；命令结束后立即删除临时 token 文件，并检查 `git config --list`
   中没有 `x-access-token` 或 `gho_`。
-- 如果临时 URL 或 token 已经被输出到日志，必须把本机 `gh` token 视为已泄露：
-  先清理物理机仓库的 remote/upstream 配置，再执行 `gh auth refresh` 重新授权。
-- 当物理机网络或 git push 鉴权反复失败，但本机 `gh` 可用时，可以用 GitHub
-  Contents API 更新 fork 分支上的文件：
-  1. 用 `gh api repos/<user>/<repo>/contents/<path> --method GET -F ref=<branch> --jq .sha`
-     获取目标文件 sha。
-  2. 将本地文件 base64 后调用
-     `gh api --method PUT repos/<user>/<repo>/contents/<path> --input <json>`，
-     JSON 包含 `message`、`content`、`sha` 和 `branch`。
-  3. 用 `gh pr view` 和 `gh pr checks` 确认 PR head 与 CI 状态。
+- 如果临时 URL 或 token 已经被输出到日志，必须把对应环境中的 `gh` token 视为已泄露：
+  先清理仓库的 remote/upstream 配置，再执行 `gh auth refresh` 重新授权。
 - 更新 PR 的标准收尾：确认 PR head commit、检查 `gh pr checks`，如果 CI 失败先读
   Actions 日志定位是否由本次修改引入；修复后重新运行本地等价命令，再更新 PR。
+- 只要本次会话里执行了 push、更新了 PR 描述、或以其他方式刷新了 PR head，就必须把
+  `gh pr checks` 作为收尾步骤的一部分；若发现新增或仍存在的红灯检查属于本次修改影响，
+  需要先修复并重新推送，再把任务视为完成，不能把失败的检查留到“下次再看”。
 - 开发实现、接口对齐和行为判断所参考的设计文档，只能以项目根仓库 `design/`
   目录第一层的相应设计文档为准。依赖仓库、子仓库或其他目录中的设计文档只能作为
   历史/背景参考，不能覆盖根仓 `design/` 下的主设计文档。
@@ -230,14 +253,38 @@ openGauss FDW 现有代码模式。
 ### GitHub 提交 / 更新 PR
 
 - 当用户要求“提交到代码仓”“更新 PR”“提 PR”“同步到 GitHub”时，默认标准是：本地改动整理完成、推送到远端分支成功、PR 已创建或已更新后任务才算结束。
-- 涉及 DataInfraLab 多仓协作时，优先在物理机完成代码开发和验证，在本机 Windows 完成 GitHub 发布动作。
+- 涉及 DataInfraLab 多仓协作时，代码开发、代码检视、编译验证、Git 提交、GitHub push 和 PR 更新都优先在物理机完成，不再使用本机依赖仓副本参与发布流程。
 - 推荐流程：
   1. 在物理机仓库确认目标分支、最新 upstream、工作区状态和最终 commit。
-  2. 若物理机 `git push` 或 `gh` 网络/鉴权不稳定，使用 `git format-patch -1 --stdout HEAD` 从物理机导出补丁。
-  3. 在本机 Windows 干净 clone 上以对应 parent commit 重放补丁，形成干净单提交。
-  4. 使用本机 `gh` 登录态把分支推到 `andy123552/<repo>` fork。
-  5. 已有 PR 分支更新时，先 `git fetch fork <branch>`，再用 `git push fork HEAD:refs/heads/<branch> --force-with-lease`，避免盲目强推。
-  6. 新 PR 使用本机 `gh pr create`；已有 PR 使用 `gh pr edit` 更新标题和描述。
-- 如果需要批量更新多个仓库 PR，优先把 PR 模板正文先落到本地文件，再统一用 `gh pr edit --body-file <file>` 批量更新，避免手工拼接多段命令时出错。
-- 飞书模板改 PR 的组合链路已经验证可行：飞书 OAuth -> 搜索/下载 `PR_TEMPLATE.md` -> 本机生成 `body-file` -> `gh pr edit`。
-- 以上两类常用流程的仓内共享版 skill 放在项目根目录 `skills/`，本机可执行版放在 `~/.codex/skills/`。更新流程时，优先保持两处内容同步。
+  2. 确保本地工作分支跟踪 `fork/<branch>`，不要在 detached HEAD 或历史遗留分支上直接开发。
+  3. 已有 PR 分支更新时，先 `git fetch fork <branch>`，再用 `git push fork HEAD:refs/heads/<branch>` 或 `--force-with-lease` 更新远端。
+  4. 新 PR 使用物理机 `gh pr create`；已有 PR 使用物理机 `gh pr edit` 更新标题和描述。
+  5. 推送后必须用 `gh pr view` 和 `gh pr checks` 核对 PR head、描述和检查状态。
+- 如果需要批量更新多个仓库 PR，优先把 PR 模板正文先落到物理机本地文件，再统一用 `gh pr edit --body-file <file>` 批量更新，避免手工拼接多段命令时出错。
+- 飞书模板改 PR 的组合链路已经验证可行：飞书 OAuth -> 搜索/下载 `PR_TEMPLATE.md` -> 在物理机生成 `body-file` -> `gh pr edit`。
+- 只要输出内容包含中文（PR 描述、issue、README、设计文档、评论等），都必须在提交或发布前后做一次编码/显示核对，确认没有乱码、`????`、BOM 干扰或控制台编码误判。
+- 对 GitHub 上的中文正文，不能只看本地终端输出；应优先用 UTF-8 方式读取本地文件，并在发布后通过 `gh pr view --json body`、`gh issue view --json body` 或 GitHub API 回读确认正文内容正常，再视需要刷新网页复核。
+- 以上两类常用流程的仓内共享版 skill 放在项目根目录 `skills/`。更新流程时，以物理机工作流为准同步维护说明。
+
+## GitHub 环境补充约束
+
+- 物理机 `opengauss-ad` 上的 GitHub CLI 已确认可用，但不要假设 `gh` 一定在默认 `PATH` 里。
+- 当前已验证可用的 `gh` 路径是：`/home/ad/.local/bin/gh`。
+- 通过 `ssh opengauss-ad '...'` 执行非交互命令时，常见情况是：
+  - `command -v gh` 为空；
+  - 但 `/home/ad/.local/bin/gh` 实际存在且可执行；
+  - 因此不能仅凭一条 `gh: command not found` 就判断“物理机没有安装 gh”或“GitHub 授权失效”。
+- 只要任务涉及 GitHub 提交、push、PR 创建、PR 更新、PR 检查，默认先执行下面这组探测，再决定后续操作：
+  1. `ssh opengauss-ad 'echo PATH=$PATH; command -v gh || true; ls /home/ad/.local/bin/gh 2>/dev/null || true'`
+  2. 若 `command -v gh` 为空但绝对路径存在，则后续统一直接调用 `/home/ad/.local/bin/gh ...`
+  3. 再执行 `/home/ad/.local/bin/gh auth status`
+- 物理机上第一次做 git commit 前，还必须检查 git 身份是否已配置：
+  - `git config --global --get user.name`
+  - `git config --global --get user.email`
+- 如果上述值为空，默认配置为：
+  - `git config --global user.name 'andy123552'`
+  - `git config --global user.email 'andy123552@users.noreply.github.com'`
+- 后续若再次出现“gh 找不到”，优先归因于 `PATH` 差异，而不是直接归因于：
+  - 没安装 `gh`
+  - GitHub 未登录
+  - 之前记录的发布流程失效
