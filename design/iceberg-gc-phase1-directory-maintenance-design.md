@@ -327,7 +327,7 @@ SELECT iceberg_catalog.vacuum_index(
 flowchart TD
   A["Catalog SQL remove_orphan_files"] --> B["Catalog 查询 tables_internal"]
   B --> C["Catalog 构造 storage handle 和 table ident"]
-  C --> D["bridge C ABI: iceberg_bridge_table_remove_orphan_data_files"]
+  C --> D["bridge C ABI: iceberg_bridge_table_remove_orphan_files"]
   D --> E["SDK 加载 metadata_location 对应 Table"]
   E --> F["SDK 校验 metadata/*.metadata.json table UUID"]
   F --> G["SDK 遍历所有有效 metadata 引用，生成 protected_refs"]
@@ -410,14 +410,14 @@ SELECT iceberg_catalog.remove_orphan_files(
 2. 从 ``iceberg_catalog.tables_internal`` 按 namespace/table 查表，读取 `table_uuid`、`metadata_location`、`table_location`、`current_snapshot_id`。
 3. 根据 Catalog 中保存的 storage 配置打开 bridge storage handle；默认扫描 table root 的受控范围，不要求用户传 `location`。
 4. 构造 `IcebergBridgeTableIdent`，把 `older_than` 转换为 `grace_period_seconds`。
-5. 调用 `iceberg_bridge_table_remove_orphan_data_files`。
+5. 调用 `iceberg_bridge_table_remove_orphan_files`。
 6. bridge 返回成功时，将 JSON 字符串转成 `jsonb` 返回；bridge 返回请求级错误时抛 SQL ERROR。
 7. Catalog 不解析 manifest，不扫描对象存储，不做物理删除；文件级失败只透传在 JSON 中。
 
 bridge C ABI：
 
 ```c
-IcebergBridgeStatus iceberg_bridge_table_remove_orphan_data_files(
+IcebergBridgeStatus iceberg_bridge_table_remove_orphan_files(
     IcebergBridgeStorage *storage,
     const char *metadata_location,
     const IcebergBridgeTableIdent *table_ident,
@@ -430,21 +430,14 @@ IcebergBridgeStatus iceberg_bridge_table_remove_orphan_data_files(
 SDK 接口：
 
 ```rust
-pub struct MetadataRemoveOrphanFilesRequest {
-    pub table_namespace: Vec<String>,
-    pub table_name: String,
-    pub metadata_location: String,
-    pub dry_run: bool,
-    pub grace_period_seconds: u64,
-    pub file_io_config_json: String,
-}
-
-impl IndexEngine {
-    pub fn remove_orphan_files_by_metadata(
-        &self,
-        req: &MetadataRemoveOrphanFilesRequest,
-    ) -> Result<String>;
-}
+pub async fn remove_orphan_files(
+    config_json: &str,
+    file_io: &FileIO,
+    table: &Table,
+    metadata_location: &str,
+    dry_run: bool,
+    grace_period_seconds: u64,
+) -> Result<Value>;
 ```
 
 实现要求：
@@ -499,22 +492,14 @@ IcebergBridgeStatus iceberg_bridge_table_cleanup_old_metadata(
 SDK 接口：
 
 ```rust
-pub struct MetadataCleanupOldMetadataRequest {
-    pub table_namespace: Vec<String>,
-    pub table_name: String,
-    pub metadata_location: String,
-    pub retain_last: u64,
-    pub dry_run: bool,
-    pub grace_period_seconds: u64,
-    pub file_io_config_json: String,
-}
-
-impl IndexEngine {
-    pub fn cleanup_old_metadata_by_metadata(
-        &self,
-        req: &MetadataCleanupOldMetadataRequest,
-    ) -> Result<String>;
-}
+pub async fn cleanup_old_metadata_files(
+    config_json: &str,
+    table: &Table,
+    metadata_location: &str,
+    retain_last: usize,
+    dry_run: bool,
+    grace_period_seconds: u64,
+) -> Result<Value>;
 ```
 
 实现要求：
@@ -644,13 +629,18 @@ impl IndexEngine {
 
 ### 9.1 SDK
 
-- 在 `iceberg-index` 实现三个 metadata-location request 和同步入口。
-- 核心逻辑放在 `iceberg-index-iceberg`，bridge-facing API 放在 `iceberg-index-abi`。
+- `remove_orphan_files` 和 `cleanup_old_metadata` 的核心逻辑放在
+  `iceberg-rust-datainfra` 的 `crates/storage/opendal` 维护模块。
+- `vacuum_index` 的核心逻辑放在 `iceberg-index`，bridge-facing API 放在
+  `iceberg-index-abi`。
 - 返回 JSON 字段必须与本文一致。
 
 ### 9.2 bridge
 
 - 暴露三个 C ABI。
+- `remove_orphan_files` / `cleanup_old_metadata` 直接转调
+  `iceberg-rust-datainfra` 暴露的维护函数；
+  `vacuum_index` 转调 `iceberg-index-abi`。
 - bridge 不保留目录扫描或删除算法。
 - bridge 只做参数转换、storage config 传递、错误映射和 JSON 字符串返回。
 
