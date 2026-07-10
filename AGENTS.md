@@ -141,6 +141,11 @@ openGauss FDW 现有代码模式。
   `gh`、登录 GitHub、配置 `gh auth setup-git`、推送 fork 分支并更新 PR。
 - 涉及 GitHub push、PR、CI 修复或更新 PR 时，默认先在物理机检查：
   `export PATH="$HOME/.local/bin:$PATH"; gh auth status -h github.com`
+- 如果在某个环境中 `gh` 不可用，不要直接判断为未安装；必须先检查当前
+  `PATH`、常见绝对路径（Windows `C:\Program Files\GitHub CLI\gh.exe`，
+  Linux/WSL/物理机 `$HOME/.local/bin/gh`、`/usr/local/bin/gh`）以及其它可用
+  环境中的 `gh --version` / `gh auth status`。只有这些检查都失败后，才认为
+  需要安装或重新配置 GitHub CLI。
 - 物理机标准发布链路：
   1. 在目标仓库确认当前分支、上游分支、工作区状态和 `HEAD`
   2. 如有需要，先 `git fetch origin` / `git fetch fork`
