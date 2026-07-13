@@ -513,6 +513,9 @@ expire_snapshots -> remove_orphan_files -> cleanup_old_metadata -> vacuum_index
 ## 9. 测试计划
 
 - 构造至少 3 个 snapshots。
+- E2E 从 metadata JSON 提取 `snapshot-id` 时必须使用无损 64 位整数解析；不得使用会把 JSON number 转成 IEEE-754 double 的 `jq` 路径，否则大于 `2^53` 的 snapshot ID 会被舍入，执行用例将错误退化为 `no_op`。
+- `prepare_expire_snapshots` 必须覆盖 `dry_run=false && no_op=false`，并断言新 metadata 文件可读、仅保留预期 snapshots；只覆盖 dry-run 或 fresh-table no-op 不足以验证 metadata 重写。
+- bridge 的同步 C ABI 必须统一通过串行化的 `bridge_block_on` 驱动进程级 current-thread Tokio runtime，不得由各入口直接并发调用 `bridge_runtime().block_on(...)`。
 - 覆盖 `retain_last=1`、`retain_last=3`、显式 `snapshot_ids`。
 - 覆盖 branch/tag/reference 保护。
 - dry-run 不写 metadata、不 CAS、不删除。
