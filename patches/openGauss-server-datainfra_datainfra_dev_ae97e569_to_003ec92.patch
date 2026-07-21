@@ -1,0 +1,4377 @@
+diff --git a/doc/IndexedIceberg/vectorsearch_topk_design.md b/doc/IndexedIceberg/vectorsearch_topk_design.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb6290a3bcba7d39af22d0b1c4a44c057b4bb9c0
+--- /dev/null
++++ b/doc/IndexedIceberg/vectorsearch_topk_design.md
+@@ -0,0 +1,309 @@
++# IndexedIceberg VectorSearch TopK Design
++
++## Background
++
++IndexedIceberg accesses vector data through `iceberg_fdw`. In the current
++version, `iceberg_fdw` returns ordinary tuples to openGauss. The FDW does not
++perform TopK and does not push vector search logic to the remote side.
++
++For queries with vector distance ordering and a `LIMIT`, openGauss can avoid a
++full `Sort` by inserting a local `VectorSearch` executor node above the
++`ForeignScan`. The current implementation supports exact local TopK only, and
++only for foreign scans whose FDW name is `iceberg_fdw`.
++
++## Goals
++
++- Support local exact TopK for vector distance queries over FDW results.
++- Keep the FDW interface simple: it returns candidate tuples and the projected
++  distance expression; openGauss decides whether to use `VectorSearch`.
++- Reuse the normal expression projection path for datavec L2 distance
++  evaluation.
++- Preserve SQL semantics by keeping `Limit` above `VectorSearch`.
++- Keep strict planner matching so unsupported queries continue to use the
++  original `Sort + Limit` plan.
++- Leave clear plan-node fields for future distance metrics and approximate
++  algorithms such as IVFFlat.
++
++## Non-Goals
++
++- No IVFFlat implementation in the first version.
++- No remote TopK or remote distance pushdown.
++- No approximate result semantics.
++- No halfvec, sparsevec, bit vector, inner product, cosine, or L1 support.
++- No multi-column `ORDER BY`.
++- No `OFFSET`, percent limit, or `WITH TIES`.
++- No join, group, distinct, window, or aggregate-specific optimization.
++
++## Supported SQL Shape
++
++```sql
++SET enable_vectorsearch = on;
++
++SELECT id, embedding <-> '[1,2,3]'::vector AS distance
++FROM iceberg_foreign_table
++WHERE ...
++ORDER BY embedding <-> '[1,2,3]'::vector
++LIMIT 10;
++```
++
++The first version supports only the vector L2 operator:
++
++```sql
++embedding <-> query_vector
++```
++
++where the `ORDER BY` expression is planned as a `float8` sort key in the
++`ForeignScan` output. In the validated iceberg use case, `embedding` is a
++`vector` column from the foreign table and `query_vector` is a vector constant.
++The current planner check identifies the expression by operator OID and does
++not perform deeper operand-shape validation.
++
++## Plan Shape
++
++Current plan:
++
++```text
++Limit
++  Sort
++    ForeignScan
++```
++
++Target plan:
++
++```text
++Limit
++  VectorSearch
++    ForeignScan
++```
++
++`Limit` remains in the plan as a semantic guard. `VectorSearch` is responsible
++for returning at most the best K rows in distance order.
++
++## Planner Trigger Conditions
++
++The planner attempts this optimization only when all conditions are true:
++
++- `enable_vectorsearch = on`.
++- Input plan is directly a `ForeignScan`.
++- The foreign table belongs to an FDW named `iceberg_fdw`.
++- Query has exactly one `ORDER BY` item.
++- Query has an ordinary constant integer `LIMIT K`.
++- `K >= 0`.
++- No `OFFSET`.
++- No dynamic, parameterized, NULL, or non-integer limit.
++- Sort direction is ascending.
++- The sort operator is the `float8` less-than operator.
++- `NULLS FIRST` is not requested.
++- Sort expression is exactly a supported vector distance expression.
++- Current implementation recognizes only `vector <-> vector` by operator OID.
++
++If any condition is not met, planning must fall back to the original
++`Sort + Limit` plan.
++
++## Executor Semantics
++
++`VectorSearch` is a blocking executor node. On the first `ExecVectorSearch`
++call, it consumes all rows from its child `ForeignScan`.
++
++Execution flow:
++
++1. Initialize a K-sized max-heap ordered by distance.
++2. Pull tuples from the child plan until end of stream.
++3. Read the projected distance value from the child tuple using
++   `sortColIdx[0]`.
++4. Skip rows whose distance value is NULL.
++5. If the heap has fewer than K rows, copy the tuple into the heap.
++6. If the heap is full and the new distance is smaller than the heap maximum,
++   replace the current maximum.
++7. After the child is exhausted, sort heap contents by ascending distance.
++8. Return stored tuples one by one on subsequent calls.
++
++For `LIMIT 0`, the executor can avoid scanning the child and immediately return
++no rows.
++
++## Distance Evaluation
++
++The current `VectorSearch` executor does not call datavec distance functions
++directly. The planner requires the child `ForeignScan` target list to contain
++the distance sort key, and the executor reads that value as `float8`:
++
++```cpp
++AttrNumber distanceCol = plan->sortColIdx[0];
++Datum distanceDatum = heap_slot_getattr(slot, distanceCol, &isNull);
++double distance = DatumGetFloat8(distanceDatum);
++```
++
++This means distance type checking, dimension mismatch errors, and function
++semantics remain owned by the normal expression evaluation path for the
++`<->` operator.
++
++## Future Distance Interface
++
++Only L2 is recognized today. The plan node keeps an explicit metric field:
++
++```cpp
++typedef enum VectorSearchMetric {
++    VECTORSEARCH_METRIC_L2 = 1
++} VectorSearchMetric;
++```
++
++Future versions can add inner product, cosine, L1, halfvec, sparsevec, and
++bit-vector metrics by extending planner recognition and executor metadata.
++
++## Future Algorithm Interface
++
++The first version implements exact TopK. The node should still keep the
++algorithm choice explicit so that approximate algorithms can be added later:
++
++```cpp
++typedef enum VectorSearchAlgorithm {
++    VECTORSEARCH_ALGO_TOPK = 1
++} VectorSearchAlgorithm;
++```
++
++Future versions may add:
++
++- `VECTORSEARCH_ALGO_IVFFLAT`
++- `VECTORSEARCH_ALGO_HNSW`
++- remote pushdown-aware algorithms
++
++The first version should show `Algorithm: TopK` in `EXPLAIN`.
++
++## Tuple Storage
++
++Child plan slots are transient. `VectorSearch` must copy selected rows before
++the next child tuple is fetched.
++
++Each candidate stored in the heap should contain:
++
++- copied tuple data, preferably as a `MinimalTuple`;
++- computed distance;
++- optional sequence number for deterministic internal ordering;
++- any metadata needed to output the tuple through the node result slot.
++
++The output slot should be populated from the stored tuple.
++
++## Distance Projection
++
++`VectorSearch` depends on the child plan output containing the sort distance
++expression. It uses `sortColIdx[0]` to read that value from the tuple and does
++not recompute distance.
++
++If the query target list also selects the same distance expression, normal
++targetlist planning decides whether that expression is projected once or more
++than once. The `VectorSearch` node itself only consumes the distance sort key.
++
++## NULL Handling
++
++- If the projected distance value is NULL, skip the row.
++
++This behavior matches ordering by a distance where NULL distances should not be
++considered nearest neighbors.
++
++## Rescan Behavior
++
++`ExecReScanVectorSearch` must:
++
++- clear heap contents;
++- clear sorted output state;
++- reset emitted row count;
++- rescan the child plan;
++- rebuild TopK on the next `ExecVectorSearch` call.
++
++## Memory Contexts
++
++Recommended memory layout:
++
++- per-node context for copied TopK tuples and final result array;
++- per-tuple expression context for temporary values while scanning child rows;
++- reset per-tuple context after each input row;
++- clear per-node candidate memory on rescan and end.
++
++Memory complexity is `O(K)` for stored result tuples.
++
++## Complexity
++
++For N input rows and limit K:
++
++- distance computations: `O(N)`;
++- heap maintenance: `O(N log K)`;
++- final output ordering: `O(K log K)`;
++- memory: `O(K)` plus tuple copies.
++
++## GUC
++
++The planner is guarded by a user-settable GUC:
++
++```text
++enable_vectorsearch = off
++```
++
++The default is `off`. Users enable it explicitly for validation and performance
++comparison.
++
++## EXPLAIN
++
++Example:
++
++```text
++Limit
++  -> Vector Search
++       Algorithm: TopK
++       Metric: L2
++       TopK: 10
++       Distance Key: embedding <-> '[1,2,3]'::vector
++       -> ForeignScan
++```
++
++For `EXPLAIN ANALYZE`, useful counters include:
++
++- input rows read from child;
++- distance computations;
++- rows kept in heap;
++- rows emitted.
++
++## Validation Tests
++
++Planner tests:
++
++- `enable_vectorsearch = off` produces `Sort + Limit`.
++- `enable_vectorsearch = on` produces `Vector Search` for supported
++  `iceberg_fdw` SQL.
++- unsupported operators fall back to `Sort + Limit`.
++- non-`iceberg_fdw` foreign scans fall back to `Sort + Limit`.
++- descending order falls back.
++- multi-key order falls back.
++- `OFFSET` falls back.
++- non-constant first-version limit falls back.
++
++Correctness tests:
++
++- results match `Sort + Limit` for exact L2.
++- selected distance value matches `ORDER BY` distance.
++- `WHERE` filters from the FDW child are respected.
++- `LIMIT 0`.
++- `LIMIT 1`.
++- `LIMIT K` where K is greater than input row count.
++- empty child result.
++- NULL vector values.
++
++Executor tests:
++
++- rescan returns consistent results.
++- memory remains bounded by K copied tuples.
++- ties do not assume deterministic SQL ordering unless an additional order key
++  is present. Regression data should avoid equal distances.
++
++## Extension Path
++
++After the first version is correct, the next steps are:
++
++1. Add explicit distance reuse when selected target entries and sort keys share
++   the same expression.
++2. Add more metrics by extending planner operator recognition and the
++   `VectorSearchMetric` metadata.
++3. Add remote pushdown when the FDW can execute distance and TopK.
++4. Add approximate algorithms, starting with IVFFlat, only when there is a
++   persistent or reusable index/list source. Runtime IVFFlat built from every
++   query result is possible for experiments, but it is not expected to be a
++   good first production path.
+diff --git a/iceberg-opengauss-build/.gitignore b/iceberg-opengauss-build/.gitignore
+new file mode 100644
+index 0000000000000000000000000000000000000000..61d5e2e092ea8274bf8dc23273d94063830b1c25
+--- /dev/null
++++ b/iceberg-opengauss-build/.gitignore
+@@ -0,0 +1 @@
++local.env
+diff --git a/iceberg-opengauss-build/00-prepare-env.sh b/iceberg-opengauss-build/00-prepare-env.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..8d01a76994c8d852114bf3b252b4ec8d3409db76
+--- /dev/null
++++ b/iceberg-opengauss-build/00-prepare-env.sh
+@@ -0,0 +1,372 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# 00-prepare-env.sh
++# This script prepares the build environment by:
++# 1. Validating and cloning the missing DataInfraLab repositories with retry and integrity checks.
++# 2. Detecting the OS & architecture to download the correct openGauss binarylibs.
++# 3. Downloading with retries and extracting safely to avoid corrupt states.
++# 4. Generating a default opengauss.env file.
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++ICEBERG_OG_DEFAULT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
++export ICEBERG_OG_ROOT="${ICEBERG_OG_ROOT:-$ICEBERG_OG_DEFAULT_ROOT}"
++# GITHUB_BASE can be set externally to override the default repository prefix.
++# If not set, it defaults to the host/path of current origin remote or https://github.com/DataInfraLab.
++
++echo "=================================================="
++echo "Preparing Iceberg openGauss Build Environment"
++echo "Root directory: $ICEBERG_OG_ROOT"
++echo "=================================================="
++
++# Create the root directory if it doesn't exist
++mkdir -p "$ICEBERG_OG_ROOT"
++
++# Helper: Retry a command up to 3 times on failure
++retry_cmd() {
++    local max_attempts=3
++    local attempt=1
++    local delay=5
++    until "$@"; do
++        if (( attempt == max_attempts )); then
++            echo "Error: Command '$*' failed after $max_attempts attempts." >&2
++            return 1
++        fi
++        echo "[WARNING] Command failed. Retrying in $delay seconds (Attempt $attempt/$max_attempts)..."
++        sleep "$delay"
++        (( attempt++ ))
++    done
++}
++
++# Helper: Check disk space (warns if free space is less than 15 GB)
++check_disk_space() {
++    local target_dir="$1"
++    if ! command -v df >/dev/null 2>&1; then
++        return 0
++    fi
++    local avail_kb
++    avail_kb=$(df -Pk "$target_dir" | awk 'NR==2 {print $4}')
++    # 15 GB in KB = 15 * 1024 * 1024 = 15,728,640 KB
++    local required_kb=15728640
++    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$required_kb" ]; then
++        local avail_gb=$(( avail_kb / 1024 / 1024 ))
++        echo "[WARNING] Low disk space: Only ${avail_gb}GB available on $target_dir."
++        echo "          Binarylibs download and openGauss compilation may require at least 15GB of free space."
++        echo ""
++    fi
++}
++
++# Pre-requisite checks
++echo "--- Checking system tool requirements ---"
++for tool in git tar awk find; do
++    if ! command -v "$tool" >/dev/null 2>&1; then
++        echo "Error: Required system tool '$tool' is missing. Please install it first." >&2
++        exit 1
++    fi
++done
++echo "[OK] All required system tools are present."
++
++# Check disk space before proceeding
++check_disk_space "$ICEBERG_OG_ROOT"
++
++# 1. Clone missing DataInfraLab repositories
++declare -A REPOS=(
++    ["iceberg-index"]="main"
++    ["iceberg-rust-bridge"]="main"
++    ["iceberg_fdw"]="main"
++    ["openGauss-Catalog"]="main"
++    ["iceberg_delta"]="master"
++)
++
++# Helper: Determine clone URL based on the current origin remote configuration
++get_clone_url() {
++    local repo_name="$1"
++    local origin_url
++    
++    # If GITHUB_BASE was explicitly set by user, honor it.
++    if [ -n "${GITHUB_BASE:-}" ]; then
++        echo "$GITHUB_BASE/$repo_name.git"
++        return
++    fi
++    
++    # Retrieve current repository's origin url
++    origin_url=$(cd "$SCRIPT_DIR" && git config --get remote.origin.url || echo "")
++    
++    if [ -z "$origin_url" ]; then
++        # Default fallback to HTTPS if not a git repo or no origin set
++        echo "https://github.com/DataInfraLab/${repo_name}.git"
++        return
++    fi
++    
++    # Extract protocol and host prefix, then default to cloning from the organization (DataInfraLab)
++    # instead of the user's personal fork, while preserving the protocol/host.
++    if [[ "$origin_url" =~ ^([a-zA-Z0-9+.-]+://[^/]+/|[^@]+@[^:]+:) ]]; then
++        echo "${BASH_REMATCH[1]}DataInfraLab/${repo_name}.git"
++    else
++        # Fallback to default HTTPS DataInfraLab URL
++        echo "https://github.com/DataInfraLab/${repo_name}.git"
++    fi
++}
++
++echo ""
++echo "--- Checking DataInfraLab Repositories ---"
++for repo in "${!REPOS[@]}"; do
++    branch="${REPOS[$repo]}"
++    repo_path="$ICEBERG_OG_ROOT/$repo"
++    
++    # Check repository directory existence and git integrity
++    if [ -d "$repo_path" ]; then
++        if [ -d "$repo_path/.git" ]; then
++            echo "[OK] Repository $repo already exists at $repo_path"
++            continue
++        else
++            echo "[WARNING] Path $repo_path exists but is not a valid git repo. Cleaning up..."
++            rm -rf "$repo_path"
++        fi
++    fi
++
++    CLONE_URL=$(get_clone_url "$repo")
++    echo "[INFO] Cloning $repo (branch: $branch) from $CLONE_URL..."
++    retry_cmd git clone -b "$branch" "$CLONE_URL" "$repo_path"
++done
++
++# 2. Check and generate opengauss.env
++echo ""
++echo "--- Checking opengauss.env ---"
++OPENGAUSS_ENV="$ICEBERG_OG_ROOT/opengauss.env"
++if [ -f "$OPENGAUSS_ENV" ]; then
++    echo "[OK] opengauss.env already exists at $OPENGAUSS_ENV"
++else
++    cat << EOF > "$OPENGAUSS_ENV"
++# Minimal environment configuration for openGauss compilation.
++# Sourced by iceberg-opengauss-build/env.sh.
++
++# Custom GAUSSHOME path (placed at sibling folder of source repository)
++export GAUSSHOME="$ICEBERG_OG_ROOT/mppdb_temp_install"
++EOF
++    echo "[OK] Generated minimal opengauss.env at $OPENGAUSS_ENV"
++fi
++
++# 3. Check and download binarylibs
++echo ""
++echo "--- Checking binarylibs ---"
++BINARYLIBS_DIR="$ICEBERG_OG_ROOT/binarylibs"
++if [ -d "$BINARYLIBS_DIR" ]; then
++    echo "[OK] binarylibs already exists at $BINARYLIBS_DIR"
++else
++    echo "[INFO] binarylibs is missing. Detecting system info for download..."
++    
++    # Detect Architecture
++    ARCH="$(uname -m)"
++    echo "System Architecture: $ARCH"
++    
++    # Detect OS
++    OS_ID=""
++    OS_VERSION_ID=""
++    if [ -f /etc/os-release ]; then
++        . /etc/os-release
++        OS_ID="$ID"
++        OS_VERSION_ID="$VERSION_ID"
++    fi
++    echo "Detected OS: $OS_ID $OS_VERSION_ID"
++    
++    # If the Linux distribution is neither openEuler nor CentOS, ask the user whether to download third-party binarylibs
++    OS_ID_LOWER=$(echo "$OS_ID" | tr '[:upper:]' '[:lower:]')
++    skip_download=false
++    if [[ "$OS_ID_LOWER" != "openeuler" && "$OS_ID_LOWER" != "centos" ]]; then
++        if [ -t 0 ]; then
++            reply=""
++            if read -r -p "Your Linux distribution ($OS_ID) is neither openEuler nor CentOS. Do you want to download third-party binarylibs? [y/N]: " reply; then
++                if [[ ! "$reply" =~ ^[yY](es)?$ ]]; then
++                    skip_download=true
++                fi
++            else
++                skip_download=true
++            fi
++        else
++            echo "[INFO] Non-interactive environment detected. Skipping third-party binarylibs download for unsupported OS."
++            skip_download=true
++        fi
++    fi
++
++    if [ "$skip_download" = "true" ]; then
++        echo "[INFO] Skipped downloading third-party binarylibs."
++    else
++        # Determine the URL based on OS and Architecture
++        URL=""
++        if [[ "$OS_ID" == "openEuler" || "$OS_ID" == "openeuler" ]]; then
++            if [[ "$OS_VERSION_ID" == "24.03" ]]; then
++                if [[ "$ARCH" == "x86_64" ]]; then
++                    URL="https://opengauss.obs.cn-south-1.myhuaweicloud.com/latest/binarylibs/gcc10.3/openGauss-third_party_binarylibs_openEuler_2403_x86_64.tar.gz"
++                elif [[ "$ARCH" == "aarch64" ]]; then
++                    URL="https://opengauss.obs.cn-south-1.myhuaweicloud.com/latest/binarylibs/gcc10.3/openGauss-third_party_binarylibs_openEuler_2403_arm.tar.gz"
++                fi
++            elif [[ "$OS_VERSION_ID" == "22.03" ]]; then
++                if [[ "$ARCH" == "x86_64" ]]; then
++                    URL="https://opengauss.obs.cn-south-1.myhuaweicloud.com/latest/binarylibs/gcc10.3/openGauss-third_party_binarylibs_openEuler_2203_x86_64.tar.gz"
++                elif [[ "$ARCH" == "aarch64" ]]; then
++                    URL="https://opengauss.obs.cn-south-1.myhuaweicloud.com/latest/binarylibs/gcc10.3/openGauss-third_party_binarylibs_openEuler_2203_arm.tar.gz"
++                fi
++            fi
++        fi
++
++        # Fallback to CentOS 7.6 x86_64 if no match or other Linux distro
++        if [ -z "$URL" ]; then
++            echo "[WARNING] No precise OS/Arch binarylibs match found for $OS_ID $OS_VERSION_ID ($ARCH)."
++            if [[ "$ARCH" == "x86_64" ]]; then
++                echo "[INFO] Falling back to default CentOS 7.6 x86_64 binarylibs."
++                URL="https://opengauss.obs.cn-south-1.myhuaweicloud.com/latest/binarylibs/gcc10.3/openGauss-third_party_binarylibs_Centos7.6_x86_64.tar.gz"
++            else
++                echo "Error: Unsupported architecture $ARCH for default binarylibs fallback." >&2
++                exit 1
++            fi
++        fi
++
++        echo "Download URL: $URL"
++        TARBALL_NAME="openGauss-third_party_binarylibs.tar.gz"
++        TARBALL_PATH="$ICEBERG_OG_ROOT/$TARBALL_NAME"
++
++        echo "Downloading binarylibs..."
++        # Perform download with retries
++        if command -v curl >/dev/null 2>&1; then
++            retry_cmd curl -L -C - -o "$TARBALL_PATH" "$URL"
++        elif command -v wget >/dev/null 2>&1; then
++            retry_cmd wget -c -O "$TARBALL_PATH" "$URL"
++        else
++            echo "Error: Neither curl nor wget was found. Please download manually from $URL" >&2
++            exit 1
++        fi
++
++        echo "Extracting binarylibs..."
++        cd "$ICEBERG_OG_ROOT"
++
++        # Use a temp directory for safe extraction (prevents corrupt extraction in root)
++        TMP_EXTRACT_DIR="tmp_binarylibs_extract"
++        rm -rf "$TMP_EXTRACT_DIR"
++        mkdir -p "$TMP_EXTRACT_DIR"
++
++        if ! tar -xf "$TARBALL_NAME" -C "$TMP_EXTRACT_DIR"; then
++            echo "Error: Tar extraction failed. The downloaded tarball may be corrupt. Deleting it..." >&2
++            rm -rf "$TMP_EXTRACT_DIR" "$TARBALL_NAME"
++            exit 1
++        fi
++
++        # Find the extracted folder inside the temp folder and move it to final destination
++        EXTRACTED_SUB=$(find "$TMP_EXTRACT_DIR" -maxdepth 1 -type d ! -name "$TMP_EXTRACT_DIR" | head -n 1)
++        if [ -n "$EXTRACTED_SUB" ]; then
++            mv "$EXTRACTED_SUB" binarylibs
++            rm -rf "$TMP_EXTRACT_DIR"
++            echo "[OK] binarylibs extracted and renamed to $BINARYLIBS_DIR"
++
++            # Check sha256sum of the downloaded tarball to fix known symlink issue
++            if command -v sha256sum >/dev/null 2>&1; then
++                file_hash=$(sha256sum "$TARBALL_NAME" | awk '{print $1}')
++                if [ "$file_hash" = "1d95de0783062697479bb9fcb598631e3c1c847bb40adff113ab63247b072146" ]; then
++                    echo -e "\033[1;33m[INFO] Detected binarylibs with known onnxruntime symlink mismatch. Fixing symlinks...\033[0m"
++                    onnx_lib_dir="binarylibs/kernel/dependency/onnxruntime/comm/lib"
++                    if [ -d "$onnx_lib_dir" ]; then
++                        (
++                            cd "$onnx_lib_dir"
++                            ln -sf libonnxruntime.so.1.22.0 libonnxruntime.so.1
++                            ln -sf libonnxruntime.so.1 libonnxruntime.so
++                            echo -e "\033[1;32m[OK] Fixed onnxruntime symlinks to point to libonnxruntime.so.1.22.0\033[0m"
++                        )
++                    else
++                        echo -e "\033[1;31m[WARNING] onnxruntime lib directory not found at $onnx_lib_dir\033[0m" >&2
++                    fi
++                fi
++            else
++                echo -e "\033[1;31m[WARNING] sha256sum command not found, skipping hash verification.\033[0m" >&2
++            fi
++        else
++            echo "Error: Could not locate extracted directory structure." >&2
++            rm -rf "$TMP_EXTRACT_DIR"
++            exit 1
++        fi
++
++        # Clean up the downloaded tarball
++        rm -f "$TARBALL_NAME"
++        echo "[INFO] Cleaned up tarball file."
++    fi
++fi
++
++# 4. Check and install Rust toolchain (1.96)
++echo ""
++echo -e "\033[1;36m--- Checking Rust toolchain (1.96) ---\033[0m"
++
++# Print mirror env info if set
++if [ -n "${RUSTUP_DIST_SERVER:-}" ]; then
++    echo -e "\033[1;36m[INFO] Custom RUSTUP_DIST_SERVER detected: $RUSTUP_DIST_SERVER\033[0m"
++fi
++if [ -n "${RUSTUP_UPDATE_ROOT:-}" ]; then
++    echo -e "\033[1;36m[INFO] Custom RUSTUP_UPDATE_ROOT detected: $RUSTUP_UPDATE_ROOT\033[0m"
++fi
++
++# Source cargo env in current session if exists to avoid false-negatives
++if [ -f "$HOME/.cargo/env" ]; then
++    # shellcheck disable=SC1091
++    source "$HOME/.cargo/env"
++fi
++
++# Robust health check: Check if rustc and cargo both exist AND can execute successfully
++rust_healthy=false
++CURRENT_RUST_VERSION=""
++if command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
++    # Run rustc in an 'if' condition to safely catch non-zero exit codes under 'set -e'
++    if CURRENT_RUST_VERSION=$(rustc --version 2>/dev/null | awk '{print $2}') && [ -n "$CURRENT_RUST_VERSION" ]; then
++        rust_healthy=true
++    fi
++fi
++
++if [ "$rust_healthy" = true ]; then
++    echo -e "\033[1;36m[INFO] Found active Rust version: $CURRENT_RUST_VERSION\033[0m"
++    if [[ "$CURRENT_RUST_VERSION" != 1.96* ]]; then
++        if command -v rustup >/dev/null 2>&1; then
++            echo -e "\033[1;33m[WARNING] Rust version is not 1.96. Installing and setting default to 1.96 via rustup...\033[0m"
++            rustup toolchain install 1.96
++            rustup default 1.96
++            echo -e "\033[1;32m[OK] Rust toolchain switched to 1.96.\033[0m"
++        else
++            echo -e "\033[1;33m[WARNING] Rust version is $CURRENT_RUST_VERSION (not 1.96), and rustup is not installed.\033[0m" >&2
++            echo -e "\033[1;33m          Compilation of Rust components may fail. Please ensure Rust 1.96+ is used.\033[0m" >&2
++        fi
++    else
++        echo -e "\033[1;32m[OK] Rust toolchain 1.96 is already active.\033[0m"
++    fi
++else
++    # Rust is not healthy: Either completely missing, or shims exist but toolchain is missing/corrupted
++    if command -v rustup >/dev/null 2>&1; then
++        echo -e "\033[1;33m[WARNING] Rust shims found but toolchain is missing/broken (semi-installed state).\033[0m"
++        echo -e "\033[1;36m[INFO] Attempting to auto-repair by installing Rust 1.96 toolchain via rustup...\033[0m"
++        if rustup toolchain install 1.96 && rustup default 1.96; then
++            echo -e "\033[1;32m[OK] Rust 1.96 toolchain repaired and configured successfully.\033[0m"
++        else
++            echo -e "\033[1;31m[ERROR] Rust toolchain repair failed. Please check network/mirror settings.\033[0m" >&2
++            exit 1
++        fi
++    else
++        echo -e "\033[1;36m[INFO] Rust toolchain is missing. Installing rustup and Rust 1.96...\033[0m"
++        if command -v curl >/dev/null 2>&1; then
++            # Silent install with -y, default toolchain 1.96
++            if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.96; then
++                # Load environment
++                if [ -f "$HOME/.cargo/env" ]; then
++                    # shellcheck disable=SC1091
++                    source "$HOME/.cargo/env"
++                fi
++                echo -e "\033[1;32m[OK] Rust 1.96 toolchain installed successfully.\033[0m"
++            else
++                echo -e "\033[1;31m[ERROR] Rust installation failed.\033[0m" >&2
++                exit 1
++            fi
++        else
++            echo -e "\033[1;31m[ERROR] curl is required to install rustup. Please install curl first.\033[0m" >&2
++            exit 1
++        fi
++    fi
++fi
++
++echo ""
++echo "=================================================="
++echo "[OK] Preparation complete! Environment is ready."
++echo "=================================================="
+diff --git a/iceberg-opengauss-build/01-build-opengauss.sh b/iceberg-opengauss-build/01-build-opengauss.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..fd1a7118588b59fe5cdf0298be41359c3ab9f1a1
+--- /dev/null
++++ b/iceberg-opengauss-build/01-build-opengauss.sh
+@@ -0,0 +1,155 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++echo -e "\033[1;36m=== Stage 1: Validating paths and compilers ===\033[0m"
++require_common_paths
++require_executable "$OPENGAUSS_CC"
++require_executable "$OPENGAUSS_CXX"
++ensure_python_shim
++load_opengauss_env
++
++cd "$OPENGAUSS_REPO"
++make_install_tree_writable
++
++echo -e "\033[1;36m=== Stage 2: Compiling openGauss ===\033[0m"
++
++CPU_CORES=1
++if command -v nproc >/dev/null 2>&1; then
++    CPU_CORES=$(( $(nproc) / 2 ))
++fi
++[ "$CPU_CORES" -lt 1 ] && CPU_CORES=1
++BUILD_JOBS="${BUILD_JOBS:-$CPU_CORES}"
++INSTALL_JOBS="${INSTALL_JOBS:-$BUILD_JOBS}"
++OPENGAUSS_BUILD_MODE="${OPENGAUSS_BUILD_MODE:-source-install}"
++OPENGAUSS_GCC_VERSION="${OPENGAUSS_GCC_VERSION:-$("$OPENGAUSS_CXX" -dumpfullversion -dumpversion)}"
++OPENGAUSS_CFLAGS="${OPENGAUSS_CFLAGS:--O0}"
++
++mkdir -p "$ICEBERG_OG_LOG_DIR"
++BUILD_LOG_FILE="${OPENGAUSS_BUILD_LOG_FILE:-$ICEBERG_OG_LOG_DIR/$(date +%Y%m%d-%H%M%S)-opengauss-$OPENGAUSS_BUILD_MODE.log}"
++echo -e "\033[1;32m[INFO] Logs will be saved to: $BUILD_LOG_FILE\033[0m"
++
++if ! declare -p OPENGAUSS_EXTRA_CONFIG_OPTS >/dev/null 2>&1; then
++    if [ "${OPENGAUSS_EXTRA_CONFIG_OPT:-}" ]; then
++        # Backward-compatible simple flag list. Use OPENGAUSS_EXTRA_CONFIG_OPTS
++        # in local.env for arguments that require precise quoting.
++        read -r -a OPENGAUSS_EXTRA_CONFIG_OPTS <<< "$OPENGAUSS_EXTRA_CONFIG_OPT"
++    else
++        OPENGAUSS_EXTRA_CONFIG_OPTS=(--enable-mot --enable-bbox --enable-htap)
++    fi
++fi
++
++normalize_path() {
++    if command -v realpath >/dev/null 2>&1; then
++        realpath -m "$1"
++    else
++        echo "$1"
++    fi
++}
++
++run_source_install() {
++    echo "[INFO] Compiling openGauss from source and installing to GAUSSHOME=$GAUSSHOME"
++    echo "[INFO] BUILD_JOBS=$BUILD_JOBS INSTALL_JOBS=$INSTALL_JOBS"
++    echo "[INFO] OPENGAUSS_GCC_VERSION=$OPENGAUSS_GCC_VERSION"
++    echo "[INFO] OPENGAUSS_CXX=$OPENGAUSS_CXX"
++
++    if [ -f Makefile ]; then
++        make distclean -sj || true
++    fi
++
++    local -a configure_args=(
++        --gcc-version="$OPENGAUSS_GCC_VERSION"
++        --prefix="$GAUSSHOME"
++        --3rd="$BINARYLIBS_DIR"
++        --enable-debug
++        --enable-cassert
++        --enable-thread-safety
++        --with-readline
++        --without-zlib
++        CC="$OPENGAUSS_CXX"
++        CFLAGS="$OPENGAUSS_CFLAGS"
++        "${OPENGAUSS_EXTRA_CONFIG_OPTS[@]}"
++    )
++
++    ./configure "${configure_args[@]}"
++
++    make -sj "$BUILD_JOBS"
++    make install -sj "$INSTALL_JOBS"
++}
++
++run_build_sh() {
++    local build_sh_install_dir
++    build_sh_install_dir="$OPENGAUSS_REPO/mppdb_temp_install"
++
++    if [ "$(normalize_path "$GAUSSHOME")" != "$(normalize_path "$build_sh_install_dir")" ]; then
++        echo "Error: OPENGAUSS_BUILD_MODE=build-sh installs to $build_sh_install_dir," >&2
++        echo "but GAUSSHOME is $GAUSSHOME." >&2
++        echo "Use OPENGAUSS_BUILD_MODE=source-install for a custom GAUSSHOME, or set" >&2
++        echo "GAUSSHOME=$build_sh_install_dir when intentionally using build.sh compatibility mode." >&2
++        return 1
++    fi
++
++    echo "[INFO] Compiling openGauss with build.sh..."
++    sh build.sh -m debug -3rd "$BINARYLIBS_DIR"
++}
++
++run_stage2() {
++    case "$OPENGAUSS_BUILD_MODE" in
++        source-install)
++            run_source_install
++            ;;
++        build-sh)
++            run_build_sh
++            ;;
++        custom-hook)
++            if ! declare -F og_build_install_debug >/dev/null; then
++                echo "Error: OPENGAUSS_BUILD_MODE=custom-hook but og_build_install_debug is not defined" >&2
++                return 1
++            fi
++            echo "[INFO] Running custom og_build_install_debug hook..."
++            og_build_install_debug "$OPENGAUSS_REPO" "$BINARYLIBS_DIR"
++            ;;
++        *)
++            echo "Error: unknown OPENGAUSS_BUILD_MODE=$OPENGAUSS_BUILD_MODE" >&2
++            echo "Expected one of: source-install, build-sh, custom-hook" >&2
++            return 2
++            ;;
++    esac
++}
++
++if run_stage2 >"$BUILD_LOG_FILE" 2>&1; then
++    :
++else
++    rc=$?
++    echo "Error: openGauss build failed with exit code $rc" >&2
++    echo "Full log: $BUILD_LOG_FILE" >&2
++    echo "Failure excerpt:" >&2
++    iceberg_og_log_excerpt "$BUILD_LOG_FILE"
++    exit "$rc"
++fi
++
++echo -e "\033[1;36m=== Stage 3: Verifying openGauss installation ===\033[0m"
++if [ ! -x "$GAUSSHOME/bin/pg_config" ]; then
++    echo "Error: pg_config not found or not executable at $GAUSSHOME/bin/pg_config" >&2
++    exit 1
++fi
++if [ ! -x "$GAUSSHOME/bin/gsql" ]; then
++    echo "Error: gsql not found or not executable at $GAUSSHOME/bin/gsql" >&2
++    exit 1
++fi
++if [ ! -x "$GAUSSHOME/bin/gaussdb" ]; then
++    echo "Error: gaussdb not found or not executable at $GAUSSHOME/bin/gaussdb" >&2
++    exit 1
++fi
++
++echo "Installed pg_config version:"
++"$GAUSSHOME/bin/pg_config" --version
++echo "Installed gsql version:"
++"$GAUSSHOME/bin/gsql" --version
++
++echo "=================================================="
++echo -e "\033[1;32m[OK] openGauss build/install verified: $GAUSSHOME\033[0m"
++echo "=================================================="
+diff --git a/iceberg-opengauss-build/02-build-rust-components.sh b/iceberg-opengauss-build/02-build-rust-components.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..2aa19a1cf749ced580bd28e6a4729f9996341ebd
+--- /dev/null
++++ b/iceberg-opengauss-build/02-build-rust-components.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++main() {
++    require_common_paths
++    enter_clean_rust_env
++
++    cd "$ICEBERG_INDEX_REPO"
++    cargo check --workspace
++
++    cd "$ICEBERG_BRIDGE_REPO"
++    cargo build --release "${bridge_index_patch_args[@]}"
++
++    require_path "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so"
++    echo "Rust components verified"
++}
++
++if [ "${ICEBERG_OG_LOGGING_ACTIVE:-0}" = "1" ]; then
++    main
++else
++    run_logged_step "02-build-rust-components" main
++fi
+diff --git a/iceberg-opengauss-build/03-install-bridge-and-fdw.sh b/iceberg-opengauss-build/03-install-bridge-and-fdw.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..12cbee1179864b6943534a21bac29dbfc349024f
+--- /dev/null
++++ b/iceberg-opengauss-build/03-install-bridge-and-fdw.sh
+@@ -0,0 +1,35 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++main() {
++    require_common_paths
++    load_opengauss_env
++
++    require_path "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so"
++    mkdir -p "$GAUSSHOME/lib/postgresql"
++    cp "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so" \
++        "$GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so"
++
++    cd "$ICEBERG_FDW_REPO"
++    make PG_CONFIG="$GAUSSHOME/bin/pg_config" \
++        OPENGAUSS_SRC_INCLUDE="$OPENGAUSS_REPO/src/include"
++    make install PG_CONFIG="$GAUSSHOME/bin/pg_config"
++
++    install_extension_triplet \
++        "iceberg_fdw" \
++        "$ICEBERG_FDW_REPO/iceberg_fdw.so" \
++        "$ICEBERG_FDW_REPO/iceberg_fdw.control" \
++        "$ICEBERG_FDW_REPO/iceberg_fdw--0.1.0.sql"
++
++    echo "Bridge and iceberg_fdw installed into $GAUSSHOME"
++}
++
++if [ "${ICEBERG_OG_LOGGING_ACTIVE:-0}" = "1" ]; then
++    main
++else
++    run_logged_step "03-install-bridge-and-fdw" main
++fi
+diff --git a/iceberg-opengauss-build/04-verify-build.sh b/iceberg-opengauss-build/04-verify-build.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..53afda00a2650b0b2e547c664b5b4a834d502203
+--- /dev/null
++++ b/iceberg-opengauss-build/04-verify-build.sh
+@@ -0,0 +1,93 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++require_common_paths
++load_opengauss_env
++
++verify_opengauss() {
++    "$GAUSSHOME/bin/pg_config" --version
++    "$GAUSSHOME/bin/gsql" --version
++    test -x "$GAUSSHOME/bin/gaussdb"
++}
++
++verify_bridge() {
++    require_path "$GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so"
++    ldd "$GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so"
++    nm -D "$GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so" |
++        grep -E 'iceberg_bridge_|iceberg_index_rs_' >/dev/null
++}
++
++verify_fdw() {
++    require_path "$GAUSSHOME/lib/postgresql/iceberg_fdw.so"
++    require_path "$GAUSSHOME/lib/postgresql/proc_srclib/iceberg_fdw.so"
++    require_path "$GAUSSHOME/share/postgresql/extension/iceberg_fdw.control"
++    require_path "$GAUSSHOME/share/postgresql/extension/iceberg_fdw--0.1.0.sql"
++    ldd "$GAUSSHOME/lib/postgresql/iceberg_fdw.so"
++    nm -D "$GAUSSHOME/lib/postgresql/iceberg_fdw.so" |
++        grep 'iceberg_sdk_scan_' >/dev/null
++}
++
++verify_catalog() {
++    require_path "$GAUSSHOME/lib/postgresql/iceberg_catalog.so"
++    require_path "$GAUSSHOME/lib/postgresql/proc_srclib/iceberg_catalog.so"
++    require_path "$GAUSSHOME/share/postgresql/extension/iceberg_catalog.control"
++    require_path "$GAUSSHOME/share/postgresql/extension/iceberg_catalog--1.0.0.sql"
++    ldd "$GAUSSHOME/lib/postgresql/iceberg_catalog.so"
++    nm -D "$GAUSSHOME/lib/postgresql/iceberg_catalog.so" |
++        grep 'iceberg_' >/dev/null
++}
++
++verify_delta() {
++    require_path "$GAUSSHOME/lib/postgresql/iceberg_delta.so"
++    require_path "$GAUSSHOME/lib/postgresql/proc_srclib/iceberg_delta.so"
++    require_path "$GAUSSHOME/share/postgresql/extension/iceberg_delta.control"
++    require_path "$GAUSSHOME/share/postgresql/extension/iceberg_delta--1.0.0.sql"
++    ldd "$GAUSSHOME/lib/postgresql/iceberg_delta.so"
++    nm -D "$GAUSSHOME/lib/postgresql/iceberg_delta.so" |
++        grep 'iceberg_delta' >/dev/null
++}
++
++verify_all() {
++    verify_opengauss
++    verify_bridge
++    verify_fdw
++    verify_catalog
++    verify_delta
++}
++
++if [ "$#" -eq 0 ]; then
++    set -- all
++fi
++
++for target in "$@"; do
++    case "$target" in
++        opengauss)
++            verify_opengauss
++            ;;
++        bridge)
++            verify_bridge
++            ;;
++        fdw)
++            verify_fdw
++            ;;
++        catalog)
++            verify_catalog
++            ;;
++        delta)
++            verify_delta
++            ;;
++        all)
++            verify_all
++            ;;
++        *)
++            echo "unknown verify target: $target" >&2
++            exit 2
++            ;;
++    esac
++done
++
++echo "Build artifacts verified: $*"
+diff --git a/iceberg-opengauss-build/05-build-catalog.sh b/iceberg-opengauss-build/05-build-catalog.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..c97b953c4bab518d1bc547feb5190aa77c7770b8
+--- /dev/null
++++ b/iceberg-opengauss-build/05-build-catalog.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++main() {
++    require_common_paths
++    load_opengauss_env
++
++    require_path "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so"
++    require_path "$ICEBERG_BRIDGE_REPO/include/iceberg_bridge.h"
++
++    mkdir -p "$ICEBERG_CATALOG_REPO/deps"
++    rm -f "$ICEBERG_CATALOG_REPO/deps/libiceberg_rust_bridge.so" \
++        "$ICEBERG_CATALOG_REPO/deps/iceberg_bridge.h"
++    cp "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so" \
++        "$ICEBERG_CATALOG_REPO/deps/libiceberg_rust_bridge.so"
++    cp "$ICEBERG_BRIDGE_REPO/include/iceberg_bridge.h" \
++        "$ICEBERG_CATALOG_REPO/deps/iceberg_bridge.h"
++
++    cd "$ICEBERG_CATALOG_REPO"
++    make PG_CONFIG="$GAUSSHOME/bin/pg_config" GAUSS_SRC="$OPENGAUSS_REPO"
++
++    install_extension_triplet \
++        "iceberg_catalog" \
++        "$ICEBERG_CATALOG_REPO/iceberg_catalog.so" \
++        "$ICEBERG_CATALOG_REPO/iceberg_catalog.control" \
++        "$ICEBERG_CATALOG_REPO/iceberg_catalog--1.0.0.sql"
++
++    echo "iceberg_catalog build/install verified"
++}
++
++if [ "${ICEBERG_OG_LOGGING_ACTIVE:-0}" = "1" ]; then
++    main
++else
++    run_logged_step "05-build-catalog" main
++fi
+diff --git a/iceberg-opengauss-build/06-build-delta.sh b/iceberg-opengauss-build/06-build-delta.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..15745448f5693b0a1a7943a644abbf4a7a42da99
+--- /dev/null
++++ b/iceberg-opengauss-build/06-build-delta.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++main() {
++    require_common_paths
++    load_opengauss_env
++    require_executable "$CMAKE_BIN"
++    require_executable "$OPENGAUSS_CC"
++    require_executable "$OPENGAUSS_CXX"
++
++    mkdir -p "$ICEBERG_DELTA_BUILD_DIR"
++    cd "$ICEBERG_DELTA_BUILD_DIR"
++
++    export CC="$OPENGAUSS_CC"
++    export CXX="$OPENGAUSS_CXX"
++    export CPATH="$OPENGAUSS_THIRD_INCLUDE_PATH:${CPATH:-}"
++
++    "$CMAKE_BIN" "$ICEBERG_DELTA_REPO" \
++        -DGAUSS_SRC="$OPENGAUSS_REPO" \
++        -DICEBERG_RUST_BRIDGE_HOME="$ICEBERG_BRIDGE_REPO" \
++        -DARROW_HOME="$ARROW_HOME"
++    "$CMAKE_BIN" --build . --parallel "${BUILD_JOBS:-8}"
++
++    install_extension_triplet \
++        "iceberg_delta" \
++        "$ICEBERG_DELTA_BUILD_DIR/iceberg_delta.so" \
++        "$ICEBERG_DELTA_REPO/iceberg_delta.control" \
++        "$ICEBERG_DELTA_REPO/iceberg_delta--1.0.0.sql"
++
++    echo "iceberg_delta build/install verified"
++}
++
++if [ "${ICEBERG_OG_LOGGING_ACTIVE:-0}" = "1" ]; then
++    main
++else
++    run_logged_step "06-build-delta" main
++fi
+diff --git a/iceberg-opengauss-build/README.md b/iceberg-opengauss-build/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..10dd776e1af96ef6132fbeebcdeae1669b6d5276
+--- /dev/null
++++ b/iceberg-opengauss-build/README.md
+@@ -0,0 +1,701 @@
++# Iceberg openGauss 联合编译记录
++
++本文记录 Iceberg + openGauss 多仓联合编译流程。目标是把 `openGauss-server-datainfra`、`iceberg-index`、`iceberg-rust-bridge`、`iceberg_fdw`、`openGauss-Catalog` 和 `iceberg_delta` 编译并安装到同一个 openGauss 安装目录中，形成带 Iceberg FDW/catalog/delta/bridge 产物的 openGauss 系统。
++
++## 目录约定
++
++默认假设 `iceberg-opengauss-build` 位于 `openGauss-server-datainfra` 仓库内，多仓根目录为 `openGauss-server-datainfra` 的父目录。可以用 `ICEBERG_OG_ROOT` 覆盖。
++
++多仓根目录需要存在以下环境和项目：
++
++```text
++binarylibs
++opengauss.env
++openGauss-server-datainfra
++iceberg-arrow-deps
++iceberg-index
++iceberg-rust-bridge
++iceberg_fdw
++openGauss-Catalog
++iceberg_delta
++arrow_install          # 由 iceberg-arrow-deps/build_arrow.sh 生成
++```
++
++> [!TIP]
++> **新环境快捷初始化**：
++> 在干净环境下，你可以运行 `00-prepare-env.sh` 脚本。它会检测 OS 与架构，自动从开源社区下载并解压对应的 `binarylibs`，创建默认的 `opengauss.env`，自动拉取上述缺失的联合编译仓库，并为您自动安装和切换到所需的 Rust 1.96 工具链：
++> ```bash
++> ./iceberg-opengauss-build/00-prepare-env.sh
++> ```
++> 
++> **指定 Rust 国内镜像源（可选）**：
++> 如果您的网络下载 rustup 或 cargo 依赖较慢，可以在执行初始化脚本前导出以下环境变量（以 rsproxy 镜像源为例）：
++> ```bash
++> # 1. 设置 rustup 工具链的国内下载源
++> export RUSTUP_DIST_SERVER="https://rsproxy.cn"
++> export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
++> 
++> # 2. 执行环境配置脚本
++> ./iceberg-opengauss-build/00-prepare-env.sh
++> ```
++> 脚本执行成功后，您也可以在手动编译前配置 `~/.cargo/config.toml` 以加速 Cargo 依赖包下载：
++> ```toml
++> [source.crates-io]
++> replace-with = 'rsproxy'
++> 
++> [source.rsproxy]
++> registry = "https://rsproxy.cn/crates.io-index"
++> ```
++
++`iceberg-rust-datainfra` 存在，但本次 `iceberg-rust-bridge` 使用发布版 `iceberg = 0.9.1`，没有直接 patch 到该本地仓库。
++
++## 参考分支
++
++本脚本不强制检查分支，只根据环境变量指向的本地仓库路径编译。当前已验证环境使用的分支如下：
++
++| 组件 | 仓库目录 | 参考分支 |
++|---|---|---|
++| openGauss | `openGauss-server-datainfra` | `datainfra_dev` |
++| iceberg-index | `iceberg-index` | `main` |
++| iceberg-rust-bridge | `iceberg-rust-bridge` | `main` |
++| iceberg_fdw | `iceberg_fdw` | `main` |
++| openGauss-Catalog | `openGauss-Catalog` | `main` |
++| iceberg-arrow-deps | `iceberg-arrow-deps` | `master` |
++| iceberg_delta | `iceberg_delta` | `master` |
++
++跨仓接口需要保持一致，尤其是 `iceberg-rust-bridge/include/iceberg_bridge.h`、`iceberg-index-abi`、`iceberg_fdw` 和 `openGauss-Catalog` 之间的 ABI。若切换分支，建议至少执行对应接口两端的重新编译和验证。
++
++## 环境变量
++
++所有本地路径都通过环境变量配置。脚本不要求固定在某个用户目录下。
++
++> [!TIP]
++> **手动编译环境载入**：
++> 如果你需要在新打开的终端 Session 中手动编译各子模块（如直接运行 `make` 或 `cmake`），可以执行以下一行命令以快速初始化完整的编译器和动态库环境变量：
++> ```bash
++> source iceberg-opengauss-build/env.sh && load_opengauss_env
++> ```
++
++多机器使用时不要修改脚本本身。每台机器只维护自己的本地配置文件：
++
++```bash
++cd /path/to/code/openGauss-server-datainfra
++cp iceberg-opengauss-build/local.env.example iceberg-opengauss-build/local.env
++$EDITOR iceberg-opengauss-build/local.env
++```
++
++`local.env` 会被 `env.sh` 自动加载，并已被 `.gitignore` 忽略，不应提交。也可以不创建 `local.env`，直接在命令前传环境变量：
++
++```bash
++ICEBERG_OG_ROOT=/path/to/code \
++CMAKE_BIN=/path/to/cmake \
++./iceberg-opengauss-build/build-component.sh delta verify-delta
++```
++
++如果需要把本地配置文件放在别处：
++
++```bash
++ICEBERG_OG_LOCAL_ENV=/path/to/my-iceberg-opengauss.env \
++./iceberg-opengauss-build/build-all.sh
++```
++
++| 变量 | 默认值 | 说明 |
++|---|---|---|
++| `ICEBERG_OG_ROOT` | `iceberg-opengauss-build/../..` | 多仓根目录 |
++| `ICEBERG_OG_LOCAL_ENV` | `iceberg-opengauss-build/local.env` | 机器本地配置文件 |
++| `OPENGAUSS_REPO` | `$ICEBERG_OG_ROOT/openGauss-server-datainfra` | openGauss 仓库 |
++| `ICEBERG_INDEX_REPO` | `$ICEBERG_OG_ROOT/iceberg-index` | iceberg-index 仓库 |
++| `ICEBERG_BRIDGE_REPO` | `$ICEBERG_OG_ROOT/iceberg-rust-bridge` | Rust bridge 仓库 |
++| `ICEBERG_FDW_REPO` | `$ICEBERG_OG_ROOT/iceberg_fdw` | FDW 仓库 |
++| `ICEBERG_CATALOG_REPO` | `$ICEBERG_OG_ROOT/openGauss-Catalog` | Catalog 仓库 |
++| `ICEBERG_DELTA_REPO` | `$ICEBERG_OG_ROOT/iceberg_delta` | Delta 仓库 |
++| `BINARYLIBS_DIR` | `$ICEBERG_OG_ROOT/binarylibs` | openGauss binarylibs |
++| `OPENGAUSS_ENV` | `$ICEBERG_OG_ROOT/opengauss.env` | openGauss 构建环境文件 |
++| `GAUSSHOME` | `$ICEBERG_OG_ROOT/mppdb_temp_install` | openGauss 安装目录（位于源码上一层目录） |
++| `OG_PYTHON_SHIM` | `${TMPDIR:-/tmp}/og-python-bin` | openGauss 构建用 python shim |
++| `CMAKE_BIN` | `cmake` | CMake 可执行文件，可设为绝对路径 |
++| `OPENGAUSS_GCC_HOME` | `$BINARYLIBS_DIR/buildtools/gcc10.3` | openGauss GCC 工具链根目录 |
++| `OPENGAUSS_CC` | `$OPENGAUSS_GCC_HOME/gcc/bin/gcc` | C 编译器 |
++| `OPENGAUSS_CXX` | `$OPENGAUSS_GCC_HOME/gcc/bin/g++` | C++ 编译器 |
++| `OPENGAUSS_PYTHON_HOME` | `$BINARYLIBS_DIR/kernel/platform/python3.7` | openGauss Python 目录 |
++| `OPENGAUSS_OPENSSL_HOME` | `$BINARYLIBS_DIR/kernel/dependency/openssl/comm` | openGauss OpenSSL 目录 |
++| `OPENGAUSS_THIRD_INCLUDE_PATH` | 从 `BINARYLIBS_DIR` 推导 | Delta CMake 编译所需三方 include 路径，冒号分隔 |
++| `OPENGAUSS_THIRD_LIB_PATH` | 从 `BINARYLIBS_DIR` 推导 | openGauss 扩展构建所需三方 lib 路径，冒号分隔 |
++| `ARROW_HOME` | `$ICEBERG_OG_ROOT/arrow_install` | Apache Arrow C++ 安装目录 |
++| `ICEBERG_DELTA_BUILD_DIR` | `$ICEBERG_DELTA_REPO/tmp_build_gcc10` | Delta CMake 构建目录 |
++| `BUILD_JOBS` | `8` | 编译并行并发数（控制 openGauss make 编译与 CMake build 的并发数。不指定时 openGauss 默认自动使用系统一半的 CPU 核心数） |
++
++示例：
++
++```bash
++cd /path/to/code/openGauss-server-datainfra
++ICEBERG_OG_ROOT=/path/to/code \
++CMAKE_BIN=/path/to/cmake/bin/cmake \
++./iceberg-opengauss-build/build-component.sh delta verify-delta
++```
++
++## 一键执行
++
++首次构建前，需要先构建 Apache Arrow C++ 依赖（仅第一次需要，后续增量构建可跳过）：
++
++```bash
++cd /path/to/code/iceberg-arrow-deps
++./build_arrow.sh
++```
++
++然后执行联合编译：
++
++```bash
++cd /path/to/code/openGauss-server-datainfra
++./iceberg-opengauss-build/build-all.sh
++```
++
++如果根目录不同：
++
++```bash
++cd /path/to/code/openGauss-server-datainfra
++ICEBERG_OG_ROOT=/path/to/code ./iceberg-opengauss-build/build-all.sh
++```
++
++构建脚本默认把完整日志写入文件，终端只输出阶段、日志路径和成功/失败摘要；如果失败，脚本会自动摘录关键错误行。日志默认目录：
++
++```text
++iceberg-opengauss-build/logs/
++```
++
++可以用环境变量覆盖：
++
++```bash
++export ICEBERG_OG_LOG_DIR=/path/to/build-logs
++export ICEBERG_OG_LOG_FAILURE_LINES=200
++```
++
++> 如果 Arrow 已安装在其他位置，可设置 `ARROW_HOME` 指向该目录，例如 `ARROW_HOME=/opt/arrow ./iceberg-opengauss-build/build-all.sh`。`build-all.sh` 会在启动时检查 `$ARROW_HOME/lib64/libarrow.so` 或 `$ARROW_HOME/lib/libarrow.so`，缺失时会提示运行 `iceberg-arrow-deps/build_arrow.sh`。
++
++## 分步执行
++
++```bash
++# 1. 准备/拉取依赖仓库及二进制包
++./iceberg-opengauss-build/00-prepare-env.sh
++
++# 2. 构建 Apache Arrow C++ 依赖（首次或升级 Arrow 时需要）
++cd "$ICEBERG_OG_ROOT/iceberg-arrow-deps" && ./build_arrow.sh
++
++# 3. 编译并安装 openGauss
++./iceberg-opengauss-build/01-build-opengauss.sh
++
++# 4. 编译 Rust 组件
++./iceberg-opengauss-build/02-build-rust-components.sh
++
++# 5. 安装 bridge 与 fdw
++./iceberg-opengauss-build/03-install-bridge-and-fdw.sh
++
++# 6. 编译并安装 catalog
++./iceberg-opengauss-build/05-build-catalog.sh
++
++# 7. 编译并安装 delta
++./iceberg-opengauss-build/06-build-delta.sh
++
++# 8. 验证编译产物
++./iceberg-opengauss-build/04-verify-build.sh
++```
++
++分步执行适合定位失败阶段。`04-verify-build.sh` 只验证编译与安装产物，不启动数据库实例。
++
++## Apache Arrow C++ 依赖
++
++`iceberg_delta` 扩展依赖 Apache Arrow C++ 24.0.0。`iceberg-arrow-deps/build_arrow.sh` 会从源码构建 Arrow C++ 并安装到多仓根目录下的 `arrow_install/`：
++
++```bash
++cd "$ICEBERG_OG_ROOT/iceberg-arrow-deps"
++./build_arrow.sh
++```
++
++构建产物：
++
++```bash
++$ICEBERG_OG_ROOT/arrow_install/include/arrow/...
++$ICEBERG_OG_ROOT/arrow_install/lib64/libarrow.so*
++```
++
++`iceberg-opengauss-build/env.sh` 默认设置：
++
++```bash
++export ARROW_HOME="${ARROW_HOME:-$ICEBERG_OG_ROOT/arrow_install}"
++```
++
++如果你已经有其他位置安装的 Arrow C++，可以在 `local.env` 或命令行中覆盖 `ARROW_HOME`，只要该目录下存在 `lib64/libarrow.so` 或 `lib/libarrow.so` 即可。`build-all.sh` 会在编译 `iceberg_delta` 前检查该库，缺失时会 fail-fast 并提示运行 `iceberg-arrow-deps/build_arrow.sh`。
++
++## 部分编译
++
++如果只修改了一个仓库，通常只需要重新编译对应组件，然后重新组装或验证即可。入口脚本：
++
++```bash
++./iceberg-opengauss-build/build-component.sh <component> [component ...]
++```
++
++常用组件：
++
++```bash
++opengauss       # 重编并安装 openGauss-server-datainfra
++index           # 只检查 iceberg-index
++bridge          # 重编 iceberg-rust-bridge，并安装 bridge .so
++bridge-build    # 只重编 bridge，不安装
++bridge-install  # 只安装已有 bridge .so
++fdw             # 重编并安装 iceberg_fdw
++fdw-build       # 只重编 iceberg_fdw
++fdw-install     # 只安装已有 iceberg_fdw 产物
++catalog         # 重编并安装 openGauss-Catalog
++catalog-build   # 只重编 openGauss-Catalog
++catalog-install # 只安装已有 iceberg_catalog 产物
++delta           # 重编并安装 iceberg_delta
++delta-build     # 只重编 iceberg_delta
++delta-install   # 只安装已有 iceberg_delta 产物
++rust            # 执行 index + bridge
++assemble        # 不重编，只把已有 bridge/fdw/catalog/delta 产物装入 $GAUSSHOME
++verify          # 验证已安装产物
++verify-fdw      # 只验证 iceberg_fdw
++verify-catalog  # 只验证 iceberg_catalog
++verify-delta    # 只验证 iceberg_delta
++verify-all      # 验证全量安装产物
++all             # 完整执行 build-all.sh
++```
++
++示例：
++
++```bash
++# 只改了 iceberg_fdw
++./iceberg-opengauss-build/build-component.sh fdw verify-fdw
++
++# 只改了 iceberg-rust-bridge
++./iceberg-opengauss-build/build-component.sh bridge verify-bridge
++
++# 只改了 iceberg-index，并影响 bridge ABI 或 bridge 依赖实现
++./iceberg-opengauss-build/build-component.sh index bridge verify-bridge
++
++# 没有重编，只把已有产物重新装入 openGauss 安装目录
++./iceberg-opengauss-build/build-component.sh assemble verify-all
++
++# 只改了 openGauss-Catalog
++./iceberg-opengauss-build/build-component.sh catalog verify-catalog
++
++# 只改了 iceberg_delta
++./iceberg-opengauss-build/build-component.sh delta verify-delta
++```
++
++组件边界：
++
++- 只改 `openGauss-server-datainfra`：跑 `opengauss verify-opengauss`。
++- 只改 `iceberg-index`：如果只做 Rust 内部检查，跑 `index`；如果影响 `iceberg-index-abi` 或 bridge 依赖实现，跑 `index bridge verify-bridge`。
++- 只改 `iceberg-rust-bridge`：跑 `bridge verify-bridge`。
++- 只改 `iceberg_fdw` C/C++、control 或 SQL：跑 `fdw verify-fdw`。
++- 只改 `openGauss-Catalog`：跑 `catalog verify-catalog`。
++- 只改 `iceberg_delta`：跑 `delta verify-delta`。
++- 改跨仓接口，例如 `iceberg_bridge.h`、`iceberg_bridge_abi.h`、`iceberg-index-abi` 或 FDW/Catalog 调 bridge 的函数签名：至少重编接口两端，通常跑 `index bridge fdw catalog delta verify-all`。
++
++## Codex Skill
++
++仓库内提供了一个可复用的 Codex skill：
++
++```text
++iceberg-opengauss-build/skills/iceberg-opengauss-builder
++```
++
++该 skill 会根据用户输入或 git 变更自动选择 `build-component.sh` 的部分编译目标。日志落盘和失败摘要已经是构建脚本的默认行为；skill 主要负责选择组件和把结果整理给 Codex。
++
++在已启用 Codex skill 的环境中，可以复制到用户 skill 目录：
++
++```bash
++mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
++cp -R iceberg-opengauss-build/skills/iceberg-opengauss-builder \
++    "${CODEX_HOME:-$HOME/.codex}/skills/"
++```
++
++也可以直接按仓内路径运行包装脚本：
++
++```bash
++python3 iceberg-opengauss-build/skills/iceberg-opengauss-builder/scripts/adaptive_build.py \
++    --root "$ICEBERG_OG_ROOT" \
++    --components opengauss,fdw
++```
++
++## openGauss 编译
++
++openGauss 编译参考 `$OPENGAUSS_ENV`，默认使用 `source-install` 模式：直接执行 `configure`、`make`、`make install`，安装到 `$GAUSSHOME` 指定的自定义目录。该模式不会走 `build.sh` 内部固定的 `mppdb_temp_install` 打包/安装树流程。
++
++核心逻辑如下：
++
++```bash
++source "$OPENGAUSS_ENV"
++./configure \
++    --gcc-version="$OPENGAUSS_GCC_VERSION" \
++    --prefix="$GAUSSHOME" \
++    --3rd="$BINARYLIBS_DIR" \
++    --enable-debug \
++    --enable-cassert \
++    --enable-thread-safety \
++    --with-readline \
++    --without-zlib \
++    CC="$OPENGAUSS_CXX" \
++    CFLAGS="$OPENGAUSS_CFLAGS" \
++    "${OPENGAUSS_EXTRA_CONFIG_OPTS[@]}"
++
++make -sj "$BUILD_JOBS"
++make install -sj "$INSTALL_JOBS"
++```
++
++相关环境变量：
++
++- `GAUSSHOME`：openGauss 安装目录，可以设置为任意本机可写路径。
++- `OPENGAUSS_BUILD_MODE`：默认为 `source-install`。可选值为 `source-install`、`build-sh`、`custom-hook`。
++- `BUILD_JOBS`：编译并发数，默认取系统 CPU 核心数的一半，至少为 1。
++- `INSTALL_JOBS`：安装并发数，默认等于 `BUILD_JOBS`。
++- `OPENGAUSS_GCC_VERSION`：传给 `configure --gcc-version`，默认由 `$OPENGAUSS_CXX -dumpfullversion -dumpversion` 获取。
++- `OPENGAUSS_CFLAGS`：默认 `-O0`。
++- `OPENGAUSS_EXTRA_CONFIG_OPTS`：Bash 数组，追加传给 `configure` 的参数，默认 `(--enable-mot --enable-bbox --enable-htap)`。
++- `OPENGAUSS_EXTRA_CONFIG_OPT`：旧兼容变量，仅支持简单空格分隔 flag；需要精确引用或参数值含空格时请使用 `OPENGAUSS_EXTRA_CONFIG_OPTS` 数组。
++
++在 `local.env` 中覆盖额外 configure 参数时，推荐使用数组：
++
++```bash
++OPENGAUSS_EXTRA_CONFIG_OPTS=(
++    --enable-mot
++    --enable-bbox
++    --enable-htap
++)
++```
++
++如需兼容旧流程，可以显式设置：
++
++```bash
++export OPENGAUSS_BUILD_MODE=build-sh
++export GAUSSHOME="$OPENGAUSS_REPO/mppdb_temp_install"
++```
++
++该模式会运行 `sh build.sh -m debug -3rd "$BINARYLIBS_DIR"`，适合需要复用 openGauss 自带 `build.sh` 行为的场景；但它会使用 openGauss 脚本内部固定的 `$OPENGAUSS_REPO/mppdb_temp_install` 安装/打包流程，不支持自定义 `$GAUSSHOME`。脚本会在 `build-sh` 模式下检查 `$GAUSSHOME`，如果不是该固定目录则直接报错，避免后续误验证旧产物。
++
++如需复用旧环境中的 `og_build_install_debug` 函数，显式选择 `custom-hook` 模式，并在 `OPENGAUSS_ENV` 或 `local.env` 中定义函数：
++
++```bash
++export OPENGAUSS_BUILD_MODE=custom-hook
++
++og_build_install_debug() {
++    local opengauss_repo="$1"
++    local binarylibs_dir="$2"
++
++    # 迁移旧逻辑时可继续使用这两个入参。
++    # 函数需要负责完成编译，并把 openGauss 安装到当前 $GAUSSHOME。
++    # 例如：cd "$opengauss_repo" 后执行自定义 configure/make/install 流程。
++}
++```
++
++安装目标：
++
++```bash
++$GAUSSHOME
++```
++
++重复安装时 `$GAUSSHOME/jre` 和 `$GAUSSHOME/python` 下部分文件可能为只读 `0444`，导致安装阶段覆盖失败。脚本已在编译前执行：
++
++```bash
++chmod -R u+w "$GAUSSHOME/jre"
++chmod -R u+w "$GAUSSHOME/python"
++```
++
++仅当目录存在时执行。
++
++## Rust 组件编译
++
++Rust 已通过标准流程安装到用户目录，非交互 shell 需要加载：
++
++```bash
++source ~/.cargo/env
++```
++
++本次版本：
++
++```text
++rustc 1.96.0
++cargo 1.96.0
++```
++
++重要注意事项：Rust/Cargo 构建不要继承 openGauss 的 `LD_LIBRARY_PATH`。openGauss 安装目录下的 `libstdc++.so.6` 较旧，会导致 Cargo 编译 C 依赖时报错：
++
++```text
++GLIBCXX_3.4.29 not found
++GLIBCXX_3.4.30 not found
++```
++
++脚本在 Rust 阶段会执行：
++
++```bash
++unset PG_CONFIG GSQL_HOST GSQL_PORT
++export LD_LIBRARY_PATH=
++```
++
++然后执行：
++
++```bash
++cd "$ICEBERG_INDEX_REPO"
++cargo check --workspace
++```
++
++## bridge 编译与本地 iceberg-index patch
++
++`iceberg-rust-bridge` 的 `Cargo.toml` 默认依赖：
++
++```toml
++iceberg-index-abi = { git = "https://github.com/DataInfraLab/iceberg-index.git", branch = "main" }
++```
++
++本次执行时 Cargo 锁定的远程 revision 拉取失败：
++
++```text
++revision f0a689cc196f02ec8b5565355b143a96ce01bfcf not found
++failed to authenticate when downloading repository
++```
++
++为了验证本地多仓联合编译，脚本使用 Cargo 临时 `--config patch`，把该 git source 下的 6 个包指向本地 `iceberg-index` workspace：
++
++```bash
++iceberg-index-abi
++iceberg-index-core
++iceberg-index-iceberg
++iceberg-index-plugins
++iceberg-index-runtime
++iceberg-index-service
++```
++
++这不会改写 `Cargo.toml`。注意：Cargo 可能更新 `Cargo.lock` 中的 source 记录；如果只是验证编译，不应提交这类临时 lock 变化。
++
++bridge 编译命令由脚本封装，产物为：
++
++```bash
++$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so
++```
++
++随后复制到：
++
++```bash
++$GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so
++```
++
++## iceberg_fdw 编译安装
++
++FDW 编译必须使用 openGauss 的 PGXS：
++
++```bash
++# 推荐载入完整编译环境：source iceberg-opengauss-build/env.sh && load_opengauss_env
++# （或者只载入极简变量配置：source "$OPENGAUSS_ENV"）
++source "${OPENGAUSS_ENV:-opengauss.env}"
++cd "$ICEBERG_FDW_REPO"
++make PG_CONFIG=$GAUSSHOME/bin/pg_config \
++  OPENGAUSS_SRC_INCLUDE=$OPENGAUSS_REPO/src/include
++make install PG_CONFIG=$GAUSSHOME/bin/pg_config
++```
++
++安装产物：
++
++```bash
++$GAUSSHOME/lib/postgresql/iceberg_fdw.so
++$GAUSSHOME/share/postgresql/extension/iceberg_fdw.control
++$GAUSSHOME/share/postgresql/extension/iceberg_fdw--0.1.0.sql
++```
++
++脚本会额外把 `iceberg_fdw.so` 安装到：
++
++```bash
++$GAUSSHOME/lib/postgresql/proc_srclib/iceberg_fdw.so
++```
++
++## openGauss-Catalog 编译安装
++
++`openGauss-Catalog` 是 PGXS 扩展，构建前需要 bridge 的 C ABI 头文件和动态库。脚本会自动准备：
++
++```bash
++openGauss-Catalog/deps/iceberg_bridge.h
++openGauss-Catalog/deps/libiceberg_rust_bridge.so
++```
++
++手工编译命令：
++
++```bash
++# 推荐载入完整编译环境：source iceberg-opengauss-build/env.sh && load_opengauss_env
++# （或者只载入极简变量配置：source "$OPENGAUSS_ENV"）
++source "${OPENGAUSS_ENV:-opengauss.env}"
++cd "$ICEBERG_CATALOG_REPO"
++make PG_CONFIG=$GAUSSHOME/bin/pg_config \
++  GAUSS_SRC=$OPENGAUSS_REPO
++```
++
++安装产物：
++
++```bash
++$GAUSSHOME/lib/postgresql/iceberg_catalog.so
++$GAUSSHOME/lib/postgresql/proc_srclib/iceberg_catalog.so
++$GAUSSHOME/share/postgresql/extension/iceberg_catalog.control
++$GAUSSHOME/share/postgresql/extension/iceberg_catalog--1.0.0.sql
++```
++
++## iceberg_delta 编译安装
++
++`iceberg_delta` 使用 CMake 构建，默认构建目录：
++
++```bash
++$ICEBERG_DELTA_BUILD_DIR
++```
++
++可用 `ICEBERG_DELTA_BUILD_DIR` 覆盖。
++
++默认 CMake：
++
++```bash
++$CMAKE_BIN
++```
++
++默认 C/C++ 编译器使用 openGauss binarylibs 的 GCC 10.3：
++
++```bash
++$OPENGAUSS_CC
++$OPENGAUSS_CXX
++```
++
++可用 `OPENGAUSS_CC` 和 `OPENGAUSS_CXX` 覆盖。脚本还会通过 `CPATH` 注入 openGauss binarylibs 的 openssl、libcgroup、boost、zlib、zstd、curl、aws-sdk、python 等 include 路径，避免 server 头文件找不到三方依赖。
++
++手工编译命令：
++
++```bash
++# 推荐载入完整编译环境：source iceberg-opengauss-build/env.sh && load_opengauss_env
++# （或者只载入极简变量配置：source "$OPENGAUSS_ENV"）
++source "${OPENGAUSS_ENV:-opengauss.env}"
++mkdir -p "$ICEBERG_DELTA_BUILD_DIR"
++cd "$ICEBERG_DELTA_BUILD_DIR"
++export CC="$OPENGAUSS_CC"
++export CXX="$OPENGAUSS_CXX"
++export CPATH="$OPENGAUSS_THIRD_INCLUDE_PATH:${CPATH:-}"
++"$CMAKE_BIN" "$ICEBERG_DELTA_REPO" \
++    -DGAUSS_SRC="$OPENGAUSS_REPO" \
++    -DARROW_HOME="$ARROW_HOME"
++"$CMAKE_BIN" --build . --parallel "${BUILD_JOBS:-8}"
++```
++
++安装产物：
++
++```bash
++$GAUSSHOME/lib/postgresql/iceberg_delta.so
++$GAUSSHOME/lib/postgresql/proc_srclib/iceberg_delta.so
++$GAUSSHOME/share/postgresql/extension/iceberg_delta.control
++$GAUSSHOME/share/postgresql/extension/iceberg_delta--1.0.0.sql
++```
++
++## 验证项
++
++脚本验证以下内容：
++
++```bash
++$GAUSSHOME/bin/pg_config --version
++$GAUSSHOME/bin/gsql --version
++test -x $GAUSSHOME/bin/gaussdb
++ldd $GAUSSHOME/lib/postgresql/iceberg_fdw.so
++ldd $GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so
++ldd $GAUSSHOME/lib/postgresql/iceberg_catalog.so
++ldd $GAUSSHOME/lib/postgresql/iceberg_delta.so
++nm -D $GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so | grep -E 'iceberg_bridge_|iceberg_index_rs_'
++nm -D $GAUSSHOME/lib/postgresql/iceberg_fdw.so | grep 'iceberg_sdk_scan_'
++```
++
++本次验证通过的关键结果：
++
++```text
++openGauss 7.0.0-RC3
++iceberg_fdw.so installed
++iceberg_catalog.so installed
++iceberg_delta.so installed
++libiceberg_rust_bridge.so installed
++ldd no unresolved dependency
++libiceberg_rust_bridge.so exports iceberg_bridge_* and iceberg_index_rs_* symbols
++```
++
++## 当前链路边界
++
++当前 `iceberg_fdw.so` 没有直接强链接 `libiceberg_rust_bridge.so`；FDW 里仍然导出本地 `iceberg_sdk_scan_*` 适配函数。`openGauss-Catalog` 会通过自身 `deps/` 链接 bridge。本文和脚本验证的是编译与安装产物正确，不等价于完整 Iceberg 运行时扫描链路已经打通。
++
++后续如果要验证运行时，需要在 openGauss 实例中执行 `CREATE EXTENSION iceberg_fdw` 以及实际 Iceberg 表/扫描 SQL，并确认 FDW 适配层调用 bridge ABI。
++
++## 常见问题
++
++### Cargo 报 GLIBCXX not found
++
++原因是 Rust 阶段继承了 openGauss 的 `LD_LIBRARY_PATH`，加载了 `$GAUSSHOME/lib/libstdc++.so.6`。
++
++处理：
++
++```bash
++source ~/.cargo/env
++unset PG_CONFIG GSQL_HOST GSQL_PORT
++export LD_LIBRARY_PATH=
++```
++
++然后重新执行 Cargo 命令。
++
++### bridge 拉取 GitHub iceberg-index 失败
++
++使用本地 path patch。脚本已经内置该策略。手工执行时参考 `env.sh` 中的 `bridge_index_patch_args`。
++
++### openGauss-Catalog 与 bridge ABI 不匹配
++
++`openGauss-Catalog` 构建前会从 `iceberg-rust-bridge` 复制：
++
++```bash
++include/iceberg_bridge.h
++target/release/libiceberg_rust_bridge.so
++```
++
++因此 Catalog 源码调用的 bridge ABI 必须存在于当前 bridge 头文件和动态库中。若出现如下错误：
++
++```text
++iceberg_bridge_table_metadata_location was not declared in this scope
++iceberg_bridge_table_commit was not declared in this scope
++```
++
++说明当前 `openGauss-Catalog` 与 `iceberg-rust-bridge` 的 ABI 版本不一致，需要先对齐两边接口，再重跑：
++
++```bash
++./iceberg-opengauss-build/build-component.sh bridge catalog verify-catalog
++```
++
++### 安装阶段覆盖 jre/python 文件失败
++
++处理：
++
++```bash
++chmod -R u+w "$GAUSSHOME/jre"
++chmod -R u+w "$GAUSSHOME/python"
++```
++
++然后重跑 openGauss install。
++
++### build-all.sh 提示找不到 libarrow.so
++
++`build-all.sh` 会在编译 `iceberg_delta` 前检查 `ARROW_HOME` 是否包含 `libarrow.so`。如果报错：
++
++```text
++ERROR: Apache Arrow C++ shared library not found under ARROW_HOME=...
++To build Arrow C++ from source, run:
++  cd .../iceberg-arrow-deps && ./build_arrow.sh
++```
++
++执行：
++
++```bash
++cd "$ICEBERG_OG_ROOT/iceberg-arrow-deps"
++./build_arrow.sh
++```
++
++然后重新运行 `build-all.sh`。如果 Arrow 已安装在其他位置，可通过 `ARROW_HOME=/path/to/arrow ./iceberg-opengauss-build/build-all.sh` 指定。
++
++### 只想验证产物
++
++```bash
++./iceberg-opengauss-build/04-verify-build.sh
++```
+diff --git a/iceberg-opengauss-build/build-all.sh b/iceberg-opengauss-build/build-all.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..a946279aefc1466bccb4ee49fc8f9c3cd9bab517
+--- /dev/null
++++ b/iceberg-opengauss-build/build-all.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++require_common_paths
++
++require_arrow() {
++    if [ -z "${ARROW_HOME:-}" ]; then
++        echo "ERROR: ARROW_HOME is not set." >&2
++        echo "Set ARROW_HOME in your environment or iceberg-opengauss-build/local.env." >&2
++        exit 1
++    fi
++
++    if [ ! -f "$ARROW_HOME/lib64/libarrow.so" ] && [ ! -f "$ARROW_HOME/lib/libarrow.so" ]; then
++        echo "ERROR: Apache Arrow C++ shared library not found under ARROW_HOME=$ARROW_HOME" >&2
++        echo "" >&2
++        echo "To build Arrow C++ from source, run:" >&2
++        echo "  cd $ICEBERG_OG_ROOT/iceberg-arrow-deps && ./build_arrow.sh" >&2
++        echo "" >&2
++        echo "To use an existing Arrow C++ installation, set ARROW_HOME to its prefix" >&2
++        echo "(for example, in iceberg-opengauss-build/local.env)." >&2
++        exit 1
++    fi
++}
++
++require_arrow
++
++if [ "${SKIP_OPENGAUSS_BUILD:-0}" = "1" ]; then
++    echo "[SKIP] SKIP_OPENGAUSS_BUILD=1, skipping 01-build-opengauss.sh"
++else
++    run_logged_step "01-build-opengauss" "$SCRIPT_DIR/01-build-opengauss.sh"
++fi
++
++run_logged_step "02-build-rust-components" "$SCRIPT_DIR/02-build-rust-components.sh"
++run_logged_step "03-install-bridge-and-fdw" "$SCRIPT_DIR/03-install-bridge-and-fdw.sh"
++run_logged_step "05-build-catalog" "$SCRIPT_DIR/05-build-catalog.sh"
++run_logged_step "06-build-delta" "$SCRIPT_DIR/06-build-delta.sh"
++run_logged_step "04-verify-build" "$SCRIPT_DIR/04-verify-build.sh"
+diff --git a/iceberg-opengauss-build/build-component.sh b/iceberg-opengauss-build/build-component.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..5631b29e0c2f9bf342ab61e5ad089a596ca1db6f
+--- /dev/null
++++ b/iceberg-opengauss-build/build-component.sh
+@@ -0,0 +1,269 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck disable=SC1091
++source "$SCRIPT_DIR/env.sh"
++
++usage() {
++    cat <<'USAGE'
++Usage:
++  build-component.sh <component> [component ...]
++
++Components:
++  opengauss       Build and install openGauss-server-datainfra.
++  index           Check iceberg-index only.
++  bridge          Build iceberg-rust-bridge and install libiceberg_rust_bridge.so.
++  bridge-build    Build iceberg-rust-bridge only.
++  bridge-install  Install an existing bridge .so into $GAUSSHOME.
++  fdw             Build and install iceberg_fdw.
++  fdw-build       Build iceberg_fdw only.
++  fdw-install     Install an existing iceberg_fdw.so/control/sql into $GAUSSHOME.
++  catalog         Build and install openGauss-Catalog.
++  catalog-build   Build openGauss-Catalog only.
++  catalog-install Install existing iceberg_catalog artifacts into $GAUSSHOME.
++  delta           Build and install iceberg_delta.
++  delta-build     Build iceberg_delta only.
++  delta-install   Install existing iceberg_delta artifacts into $GAUSSHOME.
++  rust            Run index + bridge.
++  assemble        Install existing bridge, FDW, catalog, and delta artifacts.
++  verify          Verify all installed build artifacts.
++  verify-opengauss Verify openGauss installation only.
++  verify-bridge  Verify bridge installation only.
++  verify-fdw     Verify iceberg_fdw installation only.
++  verify-catalog Verify iceberg_catalog installation only.
++  verify-delta   Verify iceberg_delta installation only.
++  verify-all     Verify all installed build artifacts.
++  all             Run the full build-all.sh flow.
++
++Examples:
++  ./iceberg-opengauss-build/build-component.sh bridge verify
++  ./iceberg-opengauss-build/build-component.sh fdw verify
++  ./iceberg-opengauss-build/build-component.sh assemble verify
++USAGE
++}
++
++build_opengauss() {
++    "$SCRIPT_DIR/01-build-opengauss.sh"
++}
++
++check_index() {
++    require_common_paths
++    enter_clean_rust_env
++    cd "$ICEBERG_INDEX_REPO"
++    cargo check --workspace
++}
++
++build_bridge() {
++    require_common_paths
++    enter_clean_rust_env
++    cd "$ICEBERG_BRIDGE_REPO"
++    cargo build --release "${bridge_index_patch_args[@]}"
++    require_path "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so"
++}
++
++install_bridge() {
++    require_common_paths
++    load_opengauss_env
++    require_path "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so"
++    mkdir -p "$GAUSSHOME/lib/postgresql"
++    cp "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so" \
++        "$GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so"
++    echo "installed bridge: $GAUSSHOME/lib/postgresql/libiceberg_rust_bridge.so"
++}
++
++prepare_catalog_deps() {
++    require_common_paths
++    require_path "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so"
++    require_path "$ICEBERG_BRIDGE_REPO/include/iceberg_bridge.h"
++    mkdir -p "$ICEBERG_CATALOG_REPO/deps"
++    cp "$ICEBERG_BRIDGE_REPO/target/release/libiceberg_rust_bridge.so" \
++        "$ICEBERG_CATALOG_REPO/deps/libiceberg_rust_bridge.so"
++    cp "$ICEBERG_BRIDGE_REPO/include/iceberg_bridge.h" \
++        "$ICEBERG_CATALOG_REPO/deps/iceberg_bridge.h"
++}
++
++build_fdw() {
++    require_common_paths
++    load_opengauss_env
++    cd "$ICEBERG_FDW_REPO"
++    make PG_CONFIG="$GAUSSHOME/bin/pg_config" \
++        OPENGAUSS_SRC_INCLUDE="$OPENGAUSS_REPO/src/include"
++}
++
++install_fdw() {
++    require_common_paths
++    load_opengauss_env
++    install_extension_triplet \
++        "iceberg_fdw" \
++        "$ICEBERG_FDW_REPO/iceberg_fdw.so" \
++        "$ICEBERG_FDW_REPO/iceberg_fdw.control" \
++        "$ICEBERG_FDW_REPO/iceberg_fdw--0.1.0.sql"
++}
++
++build_and_install_fdw() {
++    build_fdw
++    install_fdw
++}
++
++build_catalog() {
++    require_common_paths
++    load_opengauss_env
++    prepare_catalog_deps
++    cd "$ICEBERG_CATALOG_REPO"
++    make PG_CONFIG="$GAUSSHOME/bin/pg_config" GAUSS_SRC="$OPENGAUSS_REPO"
++}
++
++install_catalog() {
++    require_common_paths
++    load_opengauss_env
++    install_extension_triplet \
++        "iceberg_catalog" \
++        "$ICEBERG_CATALOG_REPO/iceberg_catalog.so" \
++        "$ICEBERG_CATALOG_REPO/iceberg_catalog.control" \
++        "$ICEBERG_CATALOG_REPO/iceberg_catalog--1.0.0.sql"
++}
++
++build_and_install_catalog() {
++    build_catalog
++    install_catalog
++}
++
++build_delta() {
++    require_common_paths
++    load_opengauss_env
++    require_executable "$CMAKE_BIN"
++    require_executable "$OPENGAUSS_CC"
++    require_executable "$OPENGAUSS_CXX"
++    mkdir -p "$ICEBERG_DELTA_BUILD_DIR"
++    cd "$ICEBERG_DELTA_BUILD_DIR"
++    export CC="$OPENGAUSS_CC"
++    export CXX="$OPENGAUSS_CXX"
++    export CPATH="$OPENGAUSS_THIRD_INCLUDE_PATH:${CPATH:-}"
++    "$CMAKE_BIN" "$ICEBERG_DELTA_REPO" -DGAUSS_SRC="$OPENGAUSS_REPO"
++    "$CMAKE_BIN" --build . --parallel "${BUILD_JOBS:-8}"
++}
++
++install_delta() {
++    require_common_paths
++    load_opengauss_env
++    install_extension_triplet \
++        "iceberg_delta" \
++        "$ICEBERG_DELTA_BUILD_DIR/iceberg_delta.so" \
++        "$ICEBERG_DELTA_REPO/iceberg_delta.control" \
++        "$ICEBERG_DELTA_REPO/iceberg_delta--1.0.0.sql"
++}
++
++build_and_install_delta() {
++    build_delta
++    install_delta
++}
++
++verify_build() {
++    "$SCRIPT_DIR/04-verify-build.sh" "$@"
++}
++
++run_component() {
++    case "$1" in
++        opengauss)
++            build_opengauss
++            ;;
++        index)
++            check_index
++            ;;
++        bridge)
++            build_bridge
++            install_bridge
++            ;;
++        bridge-build)
++            build_bridge
++            ;;
++        bridge-install)
++            install_bridge
++            ;;
++        fdw)
++            build_and_install_fdw
++            ;;
++        fdw-build)
++            build_fdw
++            ;;
++        fdw-install)
++            install_fdw
++            ;;
++        catalog)
++            build_and_install_catalog
++            ;;
++        catalog-build)
++            build_catalog
++            ;;
++        catalog-install)
++            install_catalog
++            ;;
++        delta)
++            build_and_install_delta
++            ;;
++        delta-build)
++            build_delta
++            ;;
++        delta-install)
++            install_delta
++            ;;
++        rust)
++            check_index
++            build_bridge
++            install_bridge
++            ;;
++        assemble)
++            install_bridge
++            install_fdw
++            install_catalog
++            install_delta
++            ;;
++        verify)
++            verify_build all
++            ;;
++        verify-opengauss)
++            verify_build opengauss
++            ;;
++        verify-bridge)
++            verify_build bridge
++            ;;
++        verify-fdw)
++            verify_build fdw
++            ;;
++        verify-catalog)
++            verify_build catalog
++            ;;
++        verify-delta)
++            verify_build delta
++            ;;
++        verify-all)
++            verify_build all
++            ;;
++        all)
++            "$SCRIPT_DIR/build-all.sh"
++            ;;
++        -h|--help|help)
++            usage
++            ;;
++        *)
++            echo "unknown component: $1" >&2
++            usage >&2
++            exit 2
++            ;;
++    esac
++}
++
++if [ "$#" -eq 0 ]; then
++    usage >&2
++    exit 2
++fi
++
++for component in "$@"; do
++    if [ "${ICEBERG_OG_LOGGING_ACTIVE:-0}" = "1" ]; then
++        echo "==> $component"
++        run_component "$component"
++    else
++        run_logged_step "component-$component" run_component "$component"
++    fi
++done
+diff --git a/iceberg-opengauss-build/env.sh b/iceberg-opengauss-build/env.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..f95dfa9dbeb558c4ac3c7665dae0a2e349674cad
+--- /dev/null
++++ b/iceberg-opengauss-build/env.sh
+@@ -0,0 +1,274 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Shared paths for the local Iceberg + openGauss build.
++# By default this directory lives under openGauss-server-datainfra, so the
++# multi-repository root is the parent directory of the openGauss checkout.
++# Override ICEBERG_OG_ROOT before sourcing if the checkout layout is different.
++ICEBERG_OG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++ICEBERG_OG_DEFAULT_ROOT="$(cd "$ICEBERG_OG_SCRIPT_DIR/../.." && pwd)"
++
++# Machine-local overrides live outside versioned scripts. Each variable can
++# also be set in the shell before invoking a build command.
++export ICEBERG_OG_LOCAL_ENV="${ICEBERG_OG_LOCAL_ENV:-$ICEBERG_OG_SCRIPT_DIR/local.env}"
++if [ -f "$ICEBERG_OG_LOCAL_ENV" ]; then
++    # shellcheck disable=SC1090
++    source "$ICEBERG_OG_LOCAL_ENV"
++fi
++
++mark_user_override() {
++    local name="$1"
++    local marker="ICEBERG_OG_USER_${name}"
++    if [ "${!name+x}" ]; then
++        export "$marker=1"
++    fi
++}
++
++for iceberg_og_var in \
++    GAUSSHOME \
++    OPENGAUSS_BUILD_MODE \
++    OPENGAUSS_GCC_VERSION \
++    OPENGAUSS_CFLAGS \
++    OPENGAUSS_EXTRA_CONFIG_OPT \
++    OPENGAUSS_CC \
++    OPENGAUSS_CXX \
++    BUILD_JOBS \
++    INSTALL_JOBS
++do
++    mark_user_override "$iceberg_og_var"
++done
++unset iceberg_og_var
++
++export ICEBERG_OG_ROOT="${ICEBERG_OG_ROOT:-$ICEBERG_OG_DEFAULT_ROOT}"
++export OPENGAUSS_REPO="${OPENGAUSS_REPO:-$ICEBERG_OG_ROOT/openGauss-server-datainfra}"
++export ICEBERG_INDEX_REPO="${ICEBERG_INDEX_REPO:-$ICEBERG_OG_ROOT/iceberg-index}"
++export ICEBERG_BRIDGE_REPO="${ICEBERG_BRIDGE_REPO:-$ICEBERG_OG_ROOT/iceberg-rust-bridge}"
++export ICEBERG_FDW_REPO="${ICEBERG_FDW_REPO:-$ICEBERG_OG_ROOT/iceberg_fdw}"
++export ICEBERG_CATALOG_REPO="${ICEBERG_CATALOG_REPO:-$ICEBERG_OG_ROOT/openGauss-Catalog}"
++export ICEBERG_DELTA_REPO="${ICEBERG_DELTA_REPO:-$ICEBERG_OG_ROOT/iceberg_delta}"
++export ICEBERG_RUST_REPO="${ICEBERG_RUST_REPO:-$ICEBERG_OG_ROOT/iceberg-rust-datainfra}"
++export BINARYLIBS_DIR="${BINARYLIBS_DIR:-$ICEBERG_OG_ROOT/binarylibs}"
++export OPENGAUSS_ENV="${OPENGAUSS_ENV:-$ICEBERG_OG_ROOT/opengauss.env}"
++export GAUSSHOME="${GAUSSHOME:-$ICEBERG_OG_ROOT/mppdb_temp_install}"
++export OG_PYTHON_SHIM="${OG_PYTHON_SHIM:-${TMPDIR:-/tmp}/og-python-bin}"
++export ICEBERG_DELTA_BUILD_DIR="${ICEBERG_DELTA_BUILD_DIR:-$ICEBERG_DELTA_REPO/tmp_build_gcc10}"
++export ARROW_HOME="${ARROW_HOME:-$ICEBERG_OG_ROOT/arrow_install}"
++export CMAKE_BIN="${CMAKE_BIN:-cmake}"
++export OPENGAUSS_GCC_HOME="${OPENGAUSS_GCC_HOME:-$BINARYLIBS_DIR/buildtools/gcc10.3}"
++export OPENGAUSS_CC="${OPENGAUSS_CC:-$OPENGAUSS_GCC_HOME/gcc/bin/gcc}"
++export OPENGAUSS_CXX="${OPENGAUSS_CXX:-$OPENGAUSS_GCC_HOME/gcc/bin/g++}"
++export CC="$OPENGAUSS_CC"
++export CXX="$OPENGAUSS_CXX"
++export OPENGAUSS_PYTHON_HOME="${OPENGAUSS_PYTHON_HOME:-$BINARYLIBS_DIR/kernel/platform/python3.7}"
++export OPENGAUSS_OPENSSL_HOME="${OPENGAUSS_OPENSSL_HOME:-$BINARYLIBS_DIR/kernel/dependency/openssl/comm}"
++export OPENGAUSS_THIRD_INCLUDE_PATH="${OPENGAUSS_THIRD_INCLUDE_PATH:-$OPENGAUSS_OPENSSL_HOME/include:$BINARYLIBS_DIR/kernel/dependency/libcgroup/comm/include:$BINARYLIBS_DIR/kernel/dependency/boost/comm/include:$BINARYLIBS_DIR/kernel/dependency/cjson/comm/include:$BINARYLIBS_DIR/kernel/dependency/zlib1.2.11/comm/include:$BINARYLIBS_DIR/kernel/dependency/zstd/include:$BINARYLIBS_DIR/kernel/dependency/libcurl/comm/include:$BINARYLIBS_DIR/kernel/dependency/aws-sdk-cpp/comm/include:$BINARYLIBS_DIR/kernel/component/dcf/include:$OPENGAUSS_PYTHON_HOME/include/python3.7m:$BINARYLIBS_DIR/kernel/dependency/masstree/comm/include}"
++export OPENGAUSS_THIRD_LIB_PATH="${OPENGAUSS_THIRD_LIB_PATH:-$OPENGAUSS_GCC_HOME/gcc/lib64:$OPENGAUSS_GCC_HOME/isl/lib:$OPENGAUSS_GCC_HOME/mpc/lib:$OPENGAUSS_GCC_HOME/mpfr/lib:$OPENGAUSS_GCC_HOME/gmp/lib:$OPENGAUSS_PYTHON_HOME/lib:$OPENGAUSS_PYTHON_HOME/lib64:$OPENGAUSS_OPENSSL_HOME/lib}"
++export ICEBERG_OG_LOG_DIR="${ICEBERG_OG_LOG_DIR:-$ICEBERG_OG_SCRIPT_DIR/logs}"
++export ICEBERG_OG_LOG_FAILURE_LINES="${ICEBERG_OG_LOG_FAILURE_LINES:-160}"
++
++require_path() {
++    local path="$1"
++    if [ ! -e "$path" ]; then
++        echo "missing required path: $path" >&2
++        exit 1
++    fi
++}
++
++require_tool() {
++    local tool="$1"
++    if ! command -v "$tool" >/dev/null 2>&1; then
++        echo "missing required tool in PATH: $tool" >&2
++        exit 127
++    fi
++}
++
++require_executable() {
++    local executable="$1"
++    if [[ "$executable" == */* ]]; then
++        if [ -x "$executable" ]; then
++            return
++        fi
++    elif command -v "$executable" >/dev/null 2>&1; then
++        return
++    fi
++
++    echo "missing required executable: $executable" >&2
++    if [ "$executable" = "cmake" ]; then
++        echo "set CMAKE_BIN=/path/to/cmake or add cmake to PATH" >&2
++    fi
++    exit 127
++}
++
++iceberg_og_safe_name() {
++    printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'
++}
++
++iceberg_og_log_excerpt() {
++    local log_file="$1"
++    local max_lines="${2:-$ICEBERG_OG_LOG_FAILURE_LINES}"
++
++    if [ ! -f "$log_file" ]; then
++        echo "log file not found: $log_file" >&2
++        return
++    fi
++
++    local matches
++    matches="$(grep -nEi -A 5 'error:|fatal:|CMake Error|undefined reference|No such file|cannot find|recipe for target|collect2: error|Traceback|panic|failed|make(\[[0-9]+\])?: \*\*\*|Segmentation fault' "$log_file" | head -n "$max_lines" || true)"
++    if [ -n "$matches" ]; then
++        echo "$matches" >&2
++    else
++        tail -n 80 "$log_file" >&2
++    fi
++}
++
++run_logged_step() {
++    local label="$1"
++    shift
++
++    mkdir -p "$ICEBERG_OG_LOG_DIR"
++    local log_file
++    log_file="$ICEBERG_OG_LOG_DIR/$(date +%Y%m%d-%H%M%S)-$(iceberg_og_safe_name "$label").log"
++
++    echo "==> $label"
++    echo "[LOG] $log_file"
++
++    local rc
++    (
++        export ICEBERG_OG_LOGGING_ACTIVE=1
++        "$@"
++    ) >"$log_file" 2>&1
++    rc=$?
++
++    if [ "$rc" -eq 0 ]; then
++        echo "[OK] $label"
++        return 0
++    fi
++
++    echo "[FAIL] $label exited with code $rc" >&2
++    echo "[FAIL] log: $log_file" >&2
++    echo "[FAIL] excerpt:" >&2
++    iceberg_og_log_excerpt "$log_file"
++    return "$rc"
++}
++
++require_common_paths() {
++    require_path "$OPENGAUSS_REPO"
++    require_path "$ICEBERG_INDEX_REPO"
++    require_path "$ICEBERG_BRIDGE_REPO"
++    require_path "$ICEBERG_FDW_REPO"
++    require_path "$ICEBERG_CATALOG_REPO"
++    require_path "$ICEBERG_DELTA_REPO"
++    require_path "$BINARYLIBS_DIR"
++    require_path "$OPENGAUSS_ENV"
++}
++
++load_rust_env() {
++    if [ -f "$HOME/.cargo/env" ]; then
++        # shellcheck disable=SC1091
++        source "$HOME/.cargo/env"
++    fi
++    rustc --version
++    cargo --version
++}
++
++enter_clean_rust_env() {
++    load_rust_env
++    unset PG_CONFIG GSQL_HOST GSQL_PORT
++    # Do not inherit openGauss libstdc++.so.6 into cargo builds, but keep
++    # the GCC 10.3 toolchain runtime libraries (libisl, libmpc, libmpfr,
++    # libgmp) so that cargo-invoked C compilers can still run.
++    export LD_LIBRARY_PATH="$OPENGAUSS_GCC_HOME/gcc/lib64:$OPENGAUSS_GCC_HOME/isl/lib:$OPENGAUSS_GCC_HOME/mpc/lib:$OPENGAUSS_GCC_HOME/mpfr/lib:$OPENGAUSS_GCC_HOME/gmp/lib"
++}
++
++load_opengauss_env() {
++    local iceberg_og_var
++    for iceberg_og_var in \
++        GAUSSHOME \
++        OPENGAUSS_BUILD_MODE \
++        OPENGAUSS_GCC_VERSION \
++        OPENGAUSS_CFLAGS \
++        OPENGAUSS_EXTRA_CONFIG_OPT \
++        OPENGAUSS_CC \
++        OPENGAUSS_CXX \
++        BUILD_JOBS \
++        INSTALL_JOBS
++    do
++        local "ICEBERG_OG_SAVED_${iceberg_og_var}=${!iceberg_og_var-}"
++    done
++
++    # shellcheck disable=SC1090
++    source "$OPENGAUSS_ENV"
++
++    for iceberg_og_var in \
++        GAUSSHOME \
++        OPENGAUSS_BUILD_MODE \
++        OPENGAUSS_GCC_VERSION \
++        OPENGAUSS_CFLAGS \
++        OPENGAUSS_EXTRA_CONFIG_OPT \
++        OPENGAUSS_CC \
++        OPENGAUSS_CXX \
++        BUILD_JOBS \
++        INSTALL_JOBS
++    do
++        local marker="ICEBERG_OG_USER_${iceberg_og_var}"
++        local saved="ICEBERG_OG_SAVED_${iceberg_og_var}"
++        if [ "${!marker:-}" ]; then
++            export "$iceberg_og_var=${!saved}"
++        fi
++    done
++
++    export GAUSSHOME="${GAUSSHOME:-$ICEBERG_OG_ROOT/mppdb_temp_install}"
++    export CC="$OPENGAUSS_CC"
++    export CXX="$OPENGAUSS_CXX"
++    export PATH="$OG_PYTHON_SHIM:$OPENGAUSS_GCC_HOME/gcc/bin:$GAUSSHOME/bin:$PATH"
++    export LD_LIBRARY_PATH="$GAUSSHOME/lib:$GAUSSHOME/lib/postgresql:$OPENGAUSS_THIRD_LIB_PATH:${LD_LIBRARY_PATH:-}"
++}
++
++ensure_python_shim() {
++    mkdir -p "$OG_PYTHON_SHIM"
++    ln -sfn "$OPENGAUSS_PYTHON_HOME/bin/python3.7" "$OG_PYTHON_SHIM/python"
++    ln -sfn "$OPENGAUSS_PYTHON_HOME/bin/python3.7" "$OG_PYTHON_SHIM/python3"
++}
++
++make_install_tree_writable() {
++    # Reinstalling openGauss can fail when copied jre/python files are 0444.
++    if [ -d "$GAUSSHOME/jre" ]; then
++        chmod -R u+w "$GAUSSHOME/jre"
++    fi
++    if [ -d "$GAUSSHOME/python" ]; then
++        chmod -R u+w "$GAUSSHOME/python"
++    fi
++}
++
++ensure_pg_extension_dirs() {
++    mkdir -p "$GAUSSHOME/lib/postgresql" \
++        "$GAUSSHOME/lib/postgresql/proc_srclib" \
++        "$GAUSSHOME/share/postgresql/extension"
++}
++
++install_extension_triplet() {
++    local name="$1"
++    local so_path="$2"
++    local control_path="$3"
++    local sql_path="$4"
++
++    ensure_pg_extension_dirs
++    require_path "$so_path"
++    require_path "$control_path"
++    require_path "$sql_path"
++
++    install -m 755 "$so_path" "$GAUSSHOME/lib/postgresql/$name.so"
++    install -m 755 "$so_path" "$GAUSSHOME/lib/postgresql/proc_srclib/$name.so"
++    install -m 644 "$control_path" "$GAUSSHOME/share/postgresql/extension/$name.control"
++    install -m 644 "$sql_path" "$GAUSSHOME/share/postgresql/extension/$(basename "$sql_path")"
++    echo "installed extension: $name"
++}
++
++bridge_index_patch_args=(
++    --config "patch.\"https://github.com/DataInfraLab/iceberg-index.git\".iceberg-index-abi.path=\"$ICEBERG_INDEX_REPO/crates/iceberg-index-abi\""
++    --config "patch.\"https://github.com/DataInfraLab/iceberg-index.git\".iceberg-index-core.path=\"$ICEBERG_INDEX_REPO/crates/iceberg-index-core\""
++    --config "patch.\"https://github.com/DataInfraLab/iceberg-index.git\".iceberg-index-iceberg.path=\"$ICEBERG_INDEX_REPO/crates/iceberg-index-iceberg\""
++    --config "patch.\"https://github.com/DataInfraLab/iceberg-index.git\".iceberg-index-plugins.path=\"$ICEBERG_INDEX_REPO/crates/iceberg-index-plugins\""
++    --config "patch.\"https://github.com/DataInfraLab/iceberg-index.git\".iceberg-index-runtime.path=\"$ICEBERG_INDEX_REPO/crates/iceberg-index-runtime\""
++    --config "patch.\"https://github.com/DataInfraLab/iceberg-index.git\".iceberg-index-service.path=\"$ICEBERG_INDEX_REPO/crates/iceberg-index-service\""
++)
+diff --git a/iceberg-opengauss-build/local.env.example b/iceberg-opengauss-build/local.env.example
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0bbc3616e5aff4ec58de19191a4cdb2543461a1
+--- /dev/null
++++ b/iceberg-opengauss-build/local.env.example
+@@ -0,0 +1,48 @@
++# Copy this file to local.env on each machine and edit local paths there.
++# Do not edit the build scripts for machine-specific paths.
++#
++# cp iceberg-opengauss-build/local.env.example iceberg-opengauss-build/local.env
++
++# Multi-repository checkout root. Defaults to the parent directory of
++# openGauss-server-datainfra.
++# export ICEBERG_OG_ROOT=/path/to/code
++
++# Repository layout overrides. Usually unnecessary when all repositories live
++# directly under ICEBERG_OG_ROOT.
++# export OPENGAUSS_REPO=$ICEBERG_OG_ROOT/openGauss-server-datainfra
++# export ICEBERG_INDEX_REPO=$ICEBERG_OG_ROOT/iceberg-index
++# export ICEBERG_BRIDGE_REPO=$ICEBERG_OG_ROOT/iceberg-rust-bridge
++# export ICEBERG_FDW_REPO=$ICEBERG_OG_ROOT/iceberg_fdw
++# export ICEBERG_CATALOG_REPO=$ICEBERG_OG_ROOT/openGauss-Catalog
++# export ICEBERG_DELTA_REPO=$ICEBERG_OG_ROOT/iceberg_delta
++
++# openGauss build inputs.
++# export BINARYLIBS_DIR=$ICEBERG_OG_ROOT/binarylibs
++# export OPENGAUSS_ENV=$ICEBERG_OG_ROOT/opengauss.env
++# export GAUSSHOME=$OPENGAUSS_REPO/mppdb_temp_install
++
++# Toolchain overrides.
++# export CMAKE_BIN=/path/to/cmake
++# export OPENGAUSS_GCC_HOME=$BINARYLIBS_DIR/buildtools/gcc10.3
++# export OPENGAUSS_CC=$OPENGAUSS_GCC_HOME/gcc/bin/gcc
++# export OPENGAUSS_CXX=$OPENGAUSS_GCC_HOME/gcc/bin/g++
++# export OPENGAUSS_PYTHON_HOME=$BINARYLIBS_DIR/kernel/platform/python3.7
++# export OPENGAUSS_OPENSSL_HOME=$BINARYLIBS_DIR/kernel/dependency/openssl/comm
++
++# Advanced overrides. Use these when binarylibs is laid out differently.
++# export OPENGAUSS_THIRD_INCLUDE_PATH=$OPENGAUSS_OPENSSL_HOME/include:...
++# export OPENGAUSS_THIRD_LIB_PATH=$OPENGAUSS_GCC_HOME/gcc/lib64:...
++
++# Build behavior.
++# export ICEBERG_DELTA_BUILD_DIR=$ICEBERG_DELTA_REPO/tmp_build_gcc10
++# export BUILD_JOBS=8
++# export ICEBERG_OG_LOG_DIR=$OPENGAUSS_REPO/iceberg-opengauss-build/logs
++# export ICEBERG_OG_LOG_FAILURE_LINES=160
++
++# Extra openGauss configure flags. Prefer the array form when editing
++# local.env because it preserves argument boundaries.
++# OPENGAUSS_EXTRA_CONFIG_OPTS=(
++#     --enable-mot
++#     --enable-bbox
++#     --enable-htap
++# )
+diff --git a/iceberg-opengauss-build/skills/iceberg-opengauss-builder/SKILL.md b/iceberg-opengauss-build/skills/iceberg-opengauss-builder/SKILL.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8dae5ca268c273c552ca8d45021624bd398973da
+--- /dev/null
++++ b/iceberg-opengauss-build/skills/iceberg-opengauss-builder/SKILL.md
+@@ -0,0 +1,79 @@
++---
++name: iceberg-opengauss-builder
++description: Adaptive component compilation for the local Iceberg + openGauss multi-repository workspace. Use when Codex needs to build or verify openGauss-server-datainfra, iceberg-index, iceberg-rust-bridge, iceberg_fdw, openGauss-Catalog, or iceberg_delta after local changes; when the user asks for partial builds based on changed repositories; or when build logs must stay out of context except for concise failure diagnostics.
++---
++
++# Iceberg openGauss Builder
++
++## Workflow
++
++Use the bundled `scripts/adaptive_build.py` wrapper instead of invoking the raw build scripts directly when the user wants a changed-repository build or asks to compile with concise logs.
++
++1. Resolve the multi-repository root. Default to the current workspace root, or pass `--root /path/to/code` when the repositories are elsewhere.
++2. If the user names components or repositories, pass them with `--components`. Accept component names such as `opengauss`, `index`, `bridge`, `fdw`, `catalog`, `delta`, `assemble`, `verify-all`, and repository names such as `iceberg_fdw` or `openGauss-Catalog`.
++3. If the user does not name components, let the wrapper infer targets from git changes across the known repositories.
++4. Rely on the build scripts' default log behavior: full logs are written to disk, terminal output is limited to stage summaries, and failures include concise error excerpts. Inspect only focused log regions if additional diagnosis is needed.
++5. Do not stage or commit build products unless the user explicitly asks.
++
++Run from any directory:
++
++```bash
++python3 ~/.codex/skills/iceberg-opengauss-builder/scripts/adaptive_build.py --root /home/mengxin/code
++```
++
++Run a requested partial build:
++
++```bash
++python3 ~/.codex/skills/iceberg-opengauss-builder/scripts/adaptive_build.py \
++  --root /home/mengxin/code \
++  --components fdw,catalog
++```
++
++Preview targets without compiling:
++
++```bash
++python3 ~/.codex/skills/iceberg-opengauss-builder/scripts/adaptive_build.py \
++  --root /home/mengxin/code \
++  --dry-run
++```
++
++## Component Rules
++
++The wrapper delegates to `openGauss-server-datainfra/iceberg-opengauss-build/build-component.sh`.
++
++- `openGauss-server-datainfra` changes run `opengauss verify-opengauss`.
++- `iceberg-index` changes run `index`; if an ABI, header, bridge, or interface-looking file changed, run `index bridge verify-bridge`.
++- `iceberg-rust-bridge` changes run `bridge verify-bridge`.
++- `iceberg_fdw` changes run `fdw verify-fdw`.
++- `openGauss-Catalog` changes run `catalog verify-catalog`.
++- `iceberg_delta` changes run `delta verify-delta`.
++- Cross-repository interface changes run `index bridge fdw catalog delta verify-all`.
++- `assemble` means install existing bridge, FDW, catalog, and delta artifacts into `$GAUSSHOME` without rebuilding them.
++
++The existing build environment remains authoritative. Configure machine-specific paths through `iceberg-opengauss-build/local.env`, `ICEBERG_OG_ROOT`, `GAUSSHOME`, `CMAKE_BIN`, `OPENGAUSS_ENV`, `BINARYLIBS_DIR`, and related variables documented by `openGauss-server-datainfra/iceberg-opengauss-build/README.md`.
++
++## Log Handling
++
++The underlying build scripts write complete stdout and stderr to timestamped files under:
++
++```text
++openGauss-server-datainfra/iceberg-opengauss-build/logs/
++```
++
++Only report the log path, selected targets, exit status, and the extracted error excerpt. If the excerpt is insufficient, use targeted commands such as `rg -n "error:|fatal:|CMake Error|undefined reference" <log>` or `tail -n 120 <log>`. Avoid loading the entire log into context.
++
++## Failure Analysis
++
++When a build fails:
++
++1. Read the wrapper's `Failure excerpt`.
++2. Inspect the referenced log file only around matching error lines.
++3. Explain the likely root cause, the failed component, and the next repair step.
++4. Avoid code changes unless the user asked for implementation.
++
++Common local issues:
++
++- Rust/Cargo builds should not inherit openGauss `LD_LIBRARY_PATH`.
++- `iceberg_delta` must use the configured `CMAKE_BIN` plus openGauss GCC variables from the build environment.
++- FDW, Catalog, and Delta extension builds require a valid `$GAUSSHOME/bin/pg_config`.
++- Catalog requires bridge artifacts to exist because it copies `libiceberg_rust_bridge.so` and `iceberg_bridge.h` into `openGauss-Catalog/deps`.
+diff --git a/iceberg-opengauss-build/skills/iceberg-opengauss-builder/agents/openai.yaml b/iceberg-opengauss-build/skills/iceberg-opengauss-builder/agents/openai.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..14dcd9a7ecd5555ca35b4b6b5e532a46afc17b2e
+--- /dev/null
++++ b/iceberg-opengauss-build/skills/iceberg-opengauss-builder/agents/openai.yaml
+@@ -0,0 +1,4 @@
++interface:
++  display_name: "Iceberg openGauss Builder"
++  short_description: "Adaptive Iceberg openGauss component builds"
++  default_prompt: "Use $iceberg-opengauss-builder to compile the changed Iceberg/openGauss components with concise failure diagnostics."
+diff --git a/iceberg-opengauss-build/skills/iceberg-opengauss-builder/scripts/adaptive_build.py b/iceberg-opengauss-build/skills/iceberg-opengauss-builder/scripts/adaptive_build.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..121cfef3e2661eee9d79fe08e154d4f1ac87f260
+--- /dev/null
++++ b/iceberg-opengauss-build/skills/iceberg-opengauss-builder/scripts/adaptive_build.py
+@@ -0,0 +1,289 @@
++#!/usr/bin/env python3
++"""Adaptive build wrapper for the Iceberg + openGauss multi-repo workspace."""
++
++from __future__ import annotations
++
++import argparse
++import datetime as _dt
++import os
++import re
++import shlex
++import subprocess
++import sys
++from pathlib import Path
++from typing import Iterable
++
++
++REPOS = {
++    "opengauss": "openGauss-server-datainfra",
++    "index": "iceberg-index",
++    "bridge": "iceberg-rust-bridge",
++    "fdw": "iceberg_fdw",
++    "catalog": "openGauss-Catalog",
++    "delta": "iceberg_delta",
++}
++
++ALIASES = {
++    "openGauss-server-datainfra": "opengauss",
++    "openGauss-server": "opengauss",
++    "opengauss-server": "opengauss",
++    "iceberg-index": "index",
++    "iceberg-rust-bridge": "bridge",
++    "iceberg_fdw": "fdw",
++    "iceberg-fdw": "fdw",
++    "openGauss-Catalog": "catalog",
++    "opengauss-catalog": "catalog",
++    "iceberg_delta": "delta",
++    "iceberg-delta": "delta",
++}
++
++COMPONENT_TARGETS = {
++    "opengauss": ["opengauss", "verify-opengauss"],
++    "index": ["index"],
++    "bridge": ["bridge", "verify-bridge"],
++    "fdw": ["fdw", "verify-fdw"],
++    "catalog": ["catalog", "verify-catalog"],
++    "delta": ["delta", "verify-delta"],
++    "assemble": ["assemble", "verify-all"],
++    "all": ["all"],
++    "verify": ["verify-all"],
++    "verify-all": ["verify-all"],
++}
++
++DIRECT_TARGETS = {
++    "bridge-build",
++    "bridge-install",
++    "fdw-build",
++    "fdw-install",
++    "catalog-build",
++    "catalog-install",
++    "delta-build",
++    "delta-install",
++    "verify-opengauss",
++    "verify-bridge",
++    "verify-fdw",
++    "verify-catalog",
++    "verify-delta",
++}
++
++INTERFACE_RE = re.compile(
++    r"(abi|interface|bridge|catalog|fdw|foreign|extension|\.h$|Cargo\.toml$|Cargo\.lock$)",
++    re.IGNORECASE,
++)
++
++ERROR_RE = re.compile(
++    r"(error:|fatal:|CMake Error|undefined reference|No such file|cannot find|"
++    r"recipe for target|collect2: error|Traceback|panic|failed|make(\[[0-9]+\])?: \*\*\*)",
++    re.IGNORECASE,
++)
++
++
++def run_capture(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
++    return subprocess.run(cmd, cwd=str(cwd), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++
++
++def split_components(value: str | None) -> list[str]:
++    if not value:
++        return []
++    parts: list[str] = []
++    for raw in value.replace(",", " ").split():
++        item = raw.strip()
++        if item:
++            parts.append(item)
++    return parts
++
++
++def normalize_component(name: str) -> str:
++    return ALIASES.get(name, name)
++
++
++def add_unique(targets: list[str], additions: Iterable[str]) -> None:
++    for target in additions:
++        if target not in targets:
++            targets.append(target)
++
++
++def expand_requested(items: list[str]) -> list[str]:
++    targets: list[str] = []
++    unknown: list[str] = []
++    for item in items:
++        key = normalize_component(item)
++        if key in COMPONENT_TARGETS:
++            add_unique(targets, COMPONENT_TARGETS[key])
++        elif key in DIRECT_TARGETS:
++            add_unique(targets, [key])
++        else:
++            unknown.append(item)
++    if unknown:
++        raise SystemExit(f"Unknown component/repository: {', '.join(unknown)}")
++    return targets
++
++
++def repo_changes(repo: Path, base_ref: str | None, include_untracked: bool) -> list[str]:
++    if not repo.exists() or not (repo / ".git").exists():
++        return []
++
++    changes: list[str] = []
++    if base_ref:
++        diff = run_capture(["git", "diff", "--name-only", f"{base_ref}...HEAD"], repo)
++        if diff.returncode == 0:
++            changes.extend(line for line in diff.stdout.splitlines() if line)
++
++    status = run_capture(["git", "status", "--short"], repo)
++    if status.returncode == 0:
++        for line in status.stdout.splitlines():
++            if not line:
++                continue
++            code = line[:2]
++            path = line[3:].strip()
++            if " -> " in path:
++                path = path.split(" -> ", 1)[1]
++            if code == "??" and not include_untracked:
++                continue
++            if path:
++                changes.append(path)
++
++    return sorted(set(changes))
++
++
++def infer_targets(root: Path, base_ref: str | None, include_untracked: bool) -> tuple[list[str], dict[str, list[str]]]:
++    changed: dict[str, list[str]] = {}
++    interface_change = False
++    targets: list[str] = []
++
++    for component, dirname in REPOS.items():
++        paths = repo_changes(root / dirname, base_ref, include_untracked)
++        if not paths:
++            continue
++        changed[component] = paths
++        if any(INTERFACE_RE.search(path) for path in paths):
++            interface_change = True
++        add_unique(targets, COMPONENT_TARGETS[component])
++
++    if interface_change and changed:
++        targets = []
++        add_unique(targets, ["index", "bridge", "fdw", "catalog", "delta", "verify-all"])
++
++    return targets, changed
++
++
++def read_error_excerpt(log_path: Path, max_lines: int = 180) -> str:
++    try:
++        lines = log_path.read_text(errors="replace").splitlines()
++    except OSError as exc:
++        return f"Could not read log: {exc}"
++
++    matched: list[int] = [idx for idx, line in enumerate(lines) if ERROR_RE.search(line)]
++    selected: list[str] = []
++    seen: set[int] = set()
++
++    for idx in matched[:20]:
++        start = max(0, idx - 3)
++        end = min(len(lines), idx + 8)
++        for line_no in range(start, end):
++            if line_no in seen:
++                continue
++            seen.add(line_no)
++            selected.append(f"{line_no + 1}: {lines[line_no]}")
++            if len(selected) >= max_lines:
++                return "\n".join(selected)
++
++    if selected:
++        return "\n".join(selected)
++
++    tail = lines[-80:]
++    return "\n".join(f"{len(lines) - len(tail) + idx + 1}: {line}" for idx, line in enumerate(tail))
++
++
++def default_root() -> Path:
++    cwd = Path.cwd().resolve()
++    if (cwd / "openGauss-server-datainfra" / "iceberg-opengauss-build").exists():
++        return cwd
++    if cwd.name == "openGauss-server-datainfra" and (cwd / "iceberg-opengauss-build").exists():
++        return cwd.parent
++    for parent in cwd.parents:
++        if (parent / "openGauss-server-datainfra" / "iceberg-opengauss-build").exists():
++            return parent
++    return cwd
++
++
++def summarize_changes(changed: dict[str, list[str]]) -> list[str]:
++    summary: list[str] = []
++    for component, paths in changed.items():
++        sample = ", ".join(paths[:5])
++        more = "" if len(paths) <= 5 else f" (+{len(paths) - 5} more)"
++        summary.append(f"  - {REPOS[component]}: {len(paths)} changed file(s): {sample}{more}")
++    return summary
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--root", default=None, help="Multi-repository root. Defaults to auto-detected workspace root.")
++    parser.add_argument("--opengauss-repo", default=None, help="Path to openGauss-server-datainfra.")
++    parser.add_argument("--components", default=None, help="Comma/space-separated components or repository names to build.")
++    parser.add_argument("--base-ref", default=None, help="Optional git ref for committed-change detection, e.g. origin/main.")
++    parser.add_argument("--include-untracked", action="store_true", help="Include untracked files when inferring changed repositories.")
++    parser.add_argument("--log-dir", default=None, help="Directory for full build logs.")
++    parser.add_argument("--dry-run", action="store_true", help="Print inferred targets without compiling.")
++    args = parser.parse_args()
++
++    root = Path(args.root).expanduser().resolve() if args.root else default_root()
++    opengauss_repo = Path(args.opengauss_repo).expanduser().resolve() if args.opengauss_repo else root / "openGauss-server-datainfra"
++    build_script = opengauss_repo / "iceberg-opengauss-build" / "build-component.sh"
++    if not build_script.exists():
++        print(f"ERROR: build script not found: {build_script}", file=sys.stderr)
++        return 2
++
++    requested = split_components(args.components)
++    changed: dict[str, list[str]] = {}
++    if requested:
++        targets = expand_requested(requested)
++    else:
++        targets, changed = infer_targets(root, args.base_ref, args.include_untracked)
++        if not targets:
++            targets = ["assemble", "verify-all"]
++
++    log_dir = Path(args.log_dir).expanduser().resolve() if args.log_dir else opengauss_repo / "iceberg-opengauss-build" / "logs" / "adaptive"
++    timestamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
++    log_path = log_dir / f"adaptive-build-{timestamp}.log"
++
++    print(f"Workspace root: {root}")
++    print(f"openGauss repo: {opengauss_repo}")
++    if changed:
++        print("Detected changes:")
++        print("\n".join(summarize_changes(changed)))
++    elif requested:
++        print(f"Requested components: {', '.join(requested)}")
++    else:
++        print("No repository changes detected; defaulting to assemble + verify-all.")
++    print(f"Selected targets: {' '.join(targets)}")
++    print(f"Wrapper log: {log_path}")
++    print(f"Component logs: {opengauss_repo / 'iceberg-opengauss-build' / 'logs'}")
++
++    if args.dry_run:
++        print("Dry run only; build not executed.")
++        return 0
++
++    log_dir.mkdir(parents=True, exist_ok=True)
++    cmd = [str(build_script), *targets]
++    env = os.environ.copy()
++    env.setdefault("ICEBERG_OG_ROOT", str(root))
++
++    with log_path.open("w", encoding="utf-8", errors="replace") as log:
++        log.write(f"$ {' '.join(shlex.quote(part) for part in cmd)}\n")
++        log.write(f"cwd={opengauss_repo}\n\n")
++        log.flush()
++        proc = subprocess.run(cmd, cwd=str(opengauss_repo), stdout=log, stderr=subprocess.STDOUT, env=env)
++
++    if proc.returncode == 0:
++        print("Build result: success")
++        return 0
++
++    print(f"Build result: failed with exit code {proc.returncode}", file=sys.stderr)
++    print("Failure excerpt:", file=sys.stderr)
++    print(read_error_excerpt(log_path), file=sys.stderr)
++    return proc.returncode
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/common/backend/nodes/copyfuncs.cpp b/src/common/backend/nodes/copyfuncs.cpp
+index 089dd0eef6f98aeabebdbd4ff120e1cc75c3a70f..8dc6858a573caee210dd521bfa68c01a99201a92 100644
+--- a/src/common/backend/nodes/copyfuncs.cpp
++++ b/src/common/backend/nodes/copyfuncs.cpp
+@@ -1516,6 +1516,30 @@ static Sort* _copySort(const Sort* from)
+     return newnode;
+ }
+ 
++/*
++ * _copyVectorSearch
++ */
++static VectorSearch* _copyVectorSearch(const VectorSearch* from)
++{
++    VectorSearch* newnode = makeNode(VectorSearch);
++
++    CopyPlanFields((const Plan*)from, (Plan*)newnode);
++
++    COPY_SCALAR_FIELD(numCols);
++    if (from->numCols > 0) {
++        COPY_POINTER_FIELD(sortColIdx, from->numCols * sizeof(AttrNumber));
++        COPY_POINTER_FIELD(sortOperators, from->numCols * sizeof(Oid));
++        COPY_POINTER_FIELD(collations, from->numCols * sizeof(Oid));
++        COPY_POINTER_FIELD(nullsFirst, from->numCols * sizeof(bool));
++    }
++    COPY_SCALAR_FIELD(topK);
++    COPY_SCALAR_FIELD(fetchK);
++    COPY_SCALAR_FIELD(algorithm);
++    COPY_SCALAR_FIELD(metric);
++
++    return newnode;
++}
++
+ /*
+  * CopySortGroupFields
+  *
+@@ -8419,6 +8443,9 @@ void* copyObject(const void* from)
+         case T_Sort:
+             retval = _copySort((Sort*)from);
+             break;
++        case T_VectorSearch:
++            retval = _copyVectorSearch((VectorSearch*)from);
++            break;
+         case T_SortGroup:
+             retval = _copySortGroup((SortGroup*)from);
+             break;        
+diff --git a/src/common/backend/nodes/nodes.cpp b/src/common/backend/nodes/nodes.cpp
+index 10efc767de29894255b2db7bca80f233b333fa66..3d9bae9acd8be09b43a03261cdc9b541034aae79 100755
+--- a/src/common/backend/nodes/nodes.cpp
++++ b/src/common/backend/nodes/nodes.cpp
+@@ -78,6 +78,7 @@ static const TagStr g_tagStrArr[] = {{T_Invalid, "Invalid"},
+     {T_Material, "Material"},
+     {T_Memoize, "Memoize"},
+     {T_Sort, "Sort"},
++    {T_VectorSearch, "VectorSearch"},
+     {T_SortGroup, "SortGroup"},
+     {T_Group, "Group"},
+     {T_Agg, "Agg"},
+@@ -155,6 +156,7 @@ static const TagStr g_tagStrArr[] = {{T_Invalid, "Invalid"},
+     {T_MaterialState, "MaterialState"},
+     {T_MemoizeState, "MemoizeState"},
+     {T_SortState, "SortState"},
++    {T_VectorSearchState, "VectorSearchState"},
+     {T_SortGroupState, "SortGroupState"},
+     {T_GroupState, "GroupState"},
+     {T_AggState, "AggState"},
+diff --git a/src/common/backend/nodes/outfuncs.cpp b/src/common/backend/nodes/outfuncs.cpp
+index 96b7ded07761efcbfb02b4bb55ee4af5159e5e49..53365741b82badc798056652a1e70cbd9a29fdd7 100755
+--- a/src/common/backend/nodes/outfuncs.cpp
++++ b/src/common/backend/nodes/outfuncs.cpp
+@@ -2160,6 +2160,39 @@ static void _outSort(StringInfo str, Sort* node)
+     out_mem_info(str, &node->mem_info);
+ }
+ 
++static void _outVectorSearch(StringInfo str, VectorSearch* node)
++{
++    int i;
++
++    WRITE_NODE_TYPE("VECTORSEARCH");
++
++    _outPlanInfo(str, (Plan*)node);
++
++    WRITE_INT_FIELD(numCols);
++
++    appendStringInfo(str, " :sortColIdx");
++    for (i = 0; i < node->numCols; i++) {
++        appendStringInfo(str, " %d", node->sortColIdx[i]);
++    }
++
++    WRITE_GRPOP_FIELD(sortOperators, numCols);
++
++    appendStringInfo(str, " :collations");
++    for (i = 0; i < node->numCols; i++) {
++        appendStringInfo(str, " %u", node->collations[i]);
++    }
++
++    appendStringInfo(str, " :nullsFirst");
++    for (i = 0; i < node->numCols; i++) {
++        appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
++    }
++
++    WRITE_LONG_FIELD(topK);
++    WRITE_LONG_FIELD(fetchK);
++    WRITE_ENUM_FIELD(algorithm, VectorSearchAlgorithm);
++    WRITE_ENUM_FIELD(metric, VectorSearchMetric);
++}
++
+ static void _outSortGroup(StringInfo str, SortGroup* node)
+ {
+     int i;
+@@ -6990,6 +7023,9 @@ static void _outNode(StringInfo str, const void* obj)
+             case T_Sort:
+                 _outSort(str, (Sort*)obj);
+                 break;
++            case T_VectorSearch:
++                _outVectorSearch(str, (VectorSearch*)obj);
++                break;
+             case T_SortGroup:
+                 _outSortGroup(str, (SortGroup*)obj);
+                 break;
+diff --git a/src/common/backend/nodes/readfuncs.cpp b/src/common/backend/nodes/readfuncs.cpp
+index cb408eba5ea4ecdff1b31d120f789bfa9460ecaa..7d1e1eff1b7c0bdba2a70dee8c731867edab62a4 100755
+--- a/src/common/backend/nodes/readfuncs.cpp
++++ b/src/common/backend/nodes/readfuncs.cpp
+@@ -4438,6 +4438,26 @@ static Sort* _readSort(Sort* local_node)
+     READ_DONE();
+ }
+ 
++static VectorSearch* _readVectorSearch(VectorSearch* local_node)
++{
++    READ_LOCALS_NULL(VectorSearch);
++    READ_TEMP_LOCALS();
++
++    _readPlan(&local_node->plan);
++
++    READ_INT_FIELD(numCols);
++    READ_ATTR_ARRAY(sortColIdx, numCols);
++    READ_OPERATOROID_ARRAY(sortOperators, numCols);
++    READ_OID_ARRAY(collations, numCols);
++    READ_BOOL_ARRAY(nullsFirst, numCols);
++    READ_LONG_FIELD(topK);
++    READ_LONG_FIELD(fetchK);
++    READ_ENUM_FIELD(algorithm, VectorSearchAlgorithm);
++    READ_ENUM_FIELD(metric, VectorSearchMetric);
++
++    READ_DONE();
++}
++
+ static SortGroup* _readSortGroup(SortGroup* local_node)
+ {
+     READ_LOCALS_NULL(SortGroup);
+@@ -7235,6 +7255,8 @@ Node* parseNodeString(void)
+         return_value = _readSimpleSort(NULL);
+     } else if (MATCH("SORT", 4)) {
+         return_value = _readSort(NULL);
++    } else if (MATCH("VECTORSEARCH", 12)) {
++        return_value = _readVectorSearch(NULL);
+     }  else if (MATCH("SORTGROUP", 9)) {
+         return_value = _readSortGroup(NULL);
+     } else if (MATCH("SORTBY", 6)) {
+diff --git a/src/common/backend/utils/cache/plancache.cpp b/src/common/backend/utils/cache/plancache.cpp
+index 6a1112c99d66ca802160b50a294aaa1edeceb621..48ea778363a394c5f12566c46aba070b81392ec7 100644
+--- a/src/common/backend/utils/cache/plancache.cpp
++++ b/src/common/backend/utils/cache/plancache.cpp
+@@ -1301,7 +1301,8 @@ bool CheckCachedPlan(CachedPlanSource* plansource, CachedPlan *plan)
+ 
+ static inline void ResetStream(bool outer_is_stream, bool outer_is_stream_support)
+ {
+-    if (IS_PGXC_COORDINATOR) {
++    /* Single node must restore as well, otherwise a nested SPI replan leaks is_stream to the outer plan. */
++    if (IS_PGXC_COORDINATOR || IS_SINGLE_NODE) {
+         u_sess->opt_cxt.is_stream = outer_is_stream;
+         u_sess->opt_cxt.is_stream_support = outer_is_stream_support;
+     }
+diff --git a/src/common/backend/utils/misc/guc/guc_sql.cpp b/src/common/backend/utils/misc/guc/guc_sql.cpp
+index a54aa52449f6e13b68a0882ea2866561f89d5062..4812134fc7f2d6117686a975ce325064ff28d02f 100755
+--- a/src/common/backend/utils/misc/guc/guc_sql.cpp
++++ b/src/common/backend/utils/misc/guc/guc_sql.cpp
+@@ -836,6 +836,17 @@ static void InitSqlConfigureNamesBool()
+             NULL,
+             NULL,
+             NULL},
++        {{"enable_vectorsearch",
++            PGC_USERSET,
++            NODE_ALL,
++            QUERY_TUNING_METHOD,
++            gettext_noop("Enables the planner's use of VectorSearch TopK plans."),
++            NULL},
++            &u_sess->attr.attr_sql.enable_vectorsearch,
++            false,
++            NULL,
++            NULL,
++            NULL},
+ 
+         {{"enable_compress_spill",
+             PGC_USERSET,
+diff --git a/src/gausskernel/optimizer/commands/explain.cpp b/src/gausskernel/optimizer/commands/explain.cpp
+index 1c9b3a059eb9092b9b3b81c5302ffbb0e42498c4..bd45e4065852abd2b6478069374bf891c0d598d2 100755
+--- a/src/gausskernel/optimizer/commands/explain.cpp
++++ b/src/gausskernel/optimizer/commands/explain.cpp
+@@ -162,6 +162,7 @@ static void show_pushdown_qual(PlanState* planstate, List* ancestors, ExplainSta
+ static void show_upper_qual(List* qual, const char* qlabel, PlanState* planstate, List* ancestors, ExplainState* es);
+ static void show_groupby_keys(AggState* aggstate, List* ancestors, ExplainState* es);
+ static void show_sort_keys(SortState* sortstate, List* ancestors, ExplainState* es);
++static void show_vectorsearch_info(VectorSearchState* vectorstate, List* ancestors, ExplainState* es);
+ static void show_merge_append_keys(MergeAppendState* mstate, List* ancestors, ExplainState* es);
+ static void show_merge_sort_keys(PlanState* state, List* ancestors, ExplainState* es);
+ static void show_startwith_pseudo_entries(PlanState* state, List* ancestors, ExplainState* es);
+@@ -3077,6 +3078,9 @@ static void ExplainNode(
+             show_sort_info((SortState*)planstate, es);
+             show_llvm_info(planstate, es);
+             break;
++        case T_VectorSearch:
++            show_vectorsearch_info((VectorSearchState*)planstate, ancestors, es);
++            break;
+         case T_SortGroup: {
+             SortGroup *plan = (SortGroup *)planstate->plan;
+             show_sort_group_keys(planstate, "Sorted Group Key", plan->numCols, plan->sortColIdx, plan->sortOperators,
+@@ -3545,6 +3549,7 @@ static void CalculateProcessedRows(
+             break;
+         case T_Agg:
+         case T_Sort:
++        case T_VectorSearch:
+         case T_SetOp:
+         case T_VecSetOp:
+         case T_VecAgg:
+@@ -4162,6 +4167,32 @@ static void show_sort_keys(SortState* sortstate, List* ancestors, ExplainState*
+         es);
+ }
+ 
++static void show_vectorsearch_info(VectorSearchState* vectorstate, List* ancestors, ExplainState* es)
++{
++    VectorSearch* plan = (VectorSearch*)vectorstate->ss.ps.plan;
++
++    show_sort_group_keys((PlanState*)vectorstate,
++        "Distance Key",
++        plan->numCols,
++        plan->sortColIdx,
++        plan->sortOperators,
++        plan->collations,
++        plan->nullsFirst,
++        ancestors,
++        es);
++
++    ExplainPropertyText("Algorithm", "TopK", es);
++    ExplainPropertyText("Metric", "L2", es);
++    ExplainPropertyLong("TopK", plan->topK, es);
++    ExplainPropertyLong("FetchK", plan->fetchK, es);
++
++    if (es->analyze) {
++        ExplainPropertyLong("Input Rows", vectorstate->inputRows, es);
++        ExplainPropertyLong("Distance Computations", vectorstate->distanceComputations, es);
++        ExplainPropertyLong("Rows Kept", vectorstate->resultCount, es);
++    }
++}
++
+ /*
+  * Likewise, for a MergeAppend node.
+  */
+diff --git a/src/gausskernel/optimizer/path/allpaths.cpp b/src/gausskernel/optimizer/path/allpaths.cpp
+index a0760b93a73535a56a957eb988d03362b9a27e83..fc352e5ac7d03ccbbc1d25bbc20d18b40d4e9842 100755
+--- a/src/gausskernel/optimizer/path/allpaths.cpp
++++ b/src/gausskernel/optimizer/path/allpaths.cpp
+@@ -19,11 +19,14 @@
+ #include <math.h>
+ 
+ #include "access/sysattr.h"
++#include "catalog/pg_operator.h"
+ #include "catalog/pg_namespace.h"
+ #include "catalog/pg_class.h"
+ #include "catalog/pg_partition.h"
+ #include "catalog/pg_partition_fn.h"
++#include "catalog/pg_type.h"
+ #include "foreign/fdwapi.h"
++#include "lib/stringinfo.h"
+ #include "nodes/makefuncs.h"
+ #include "nodes/nodeFuncs.h"
+ #include "nodes/pg_list.h"
+@@ -68,6 +71,18 @@ THR_LOCAL set_join_pathlist_hook_type set_join_pathlist_hook = NULL;
+ const int min_parallel_table_scan_size = 1073741824 / BLCKSZ;    /* 1GB */
+ const int max_parallel_maintenance_workers = 32;
+ 
++#define VECTOR_L2_OPERATOR_OID 8311
++#define VECTORSEARCH_FETCH_MULTIPLIER 5
++#define VECTORSEARCH_FETCH_MIN 50
++#define VECTORSEARCH_FETCH_MAX 10000
++
++typedef struct PlannerVectorDatum {
++    int32 vl_len_;
++    int16 dim;
++    uint16 isoValue;
++    float x[FLEXIBLE_ARRAY_MEMBER];
++} PlannerVectorDatum;
++
+ static bool check_func_walker(Node* node, bool* found);
+ static bool check_func(Node* node);
+ 
+@@ -77,6 +92,7 @@ static void set_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti, Rang
+ static void set_plain_rel_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
+ static void set_tablesample_rel_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
+ static void set_plain_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
++static void set_vectorsearch_topk_info(PlannerInfo* root, RelOptInfo* rel);
+ static void set_foreign_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
+ static void set_foreign_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
+ static void set_append_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, RangeTblEntry* rte);
+@@ -1479,6 +1495,197 @@ static void add_upperop_for_vecscan_expr(PlannerInfo* root, RelOptInfo* rel, Lis
+     }
+ }
+ 
++static bool get_vectorsearch_const_limit_count(Query* parse, int64* topK)
++{
++    Const* limitConst = NULL;
++
++    if (parse == NULL || topK == NULL || parse->limitOffset != NULL || parse->limitCount == NULL ||
++        !IsA(parse->limitCount, Const)) {
++        return false;
++    }
++
++    limitConst = (Const*)parse->limitCount;
++    if (limitConst->constisnull) {
++        return false;
++    }
++
++    switch (limitConst->consttype) {
++        case INT8OID:
++            *topK = DatumGetInt64(limitConst->constvalue);
++            break;
++        case INT4OID:
++            *topK = DatumGetInt32(limitConst->constvalue);
++            break;
++        case INT2OID:
++            *topK = DatumGetInt16(limitConst->constvalue);
++            break;
++        default:
++            return false;
++    }
++
++    return *topK >= 0;
++}
++
++static Node* strip_vectorsearch_relabel(Node* expr)
++{
++    while (expr != NULL && IsA(expr, RelabelType)) {
++        expr = (Node*)((RelabelType*)expr)->arg;
++    }
++    return expr;
++}
++
++static int64 vectorsearch_compute_fetch_k(int64 topK)
++{
++    int64 fetchK;
++
++    if (topK <= 0) {
++        return topK;
++    }
++
++    fetchK = topK * VECTORSEARCH_FETCH_MULTIPLIER;
++    if (fetchK < VECTORSEARCH_FETCH_MIN) {
++        fetchK = VECTORSEARCH_FETCH_MIN;
++    }
++    if (fetchK < topK) {
++        fetchK = topK;
++    }
++    if (fetchK > VECTORSEARCH_FETCH_MAX) {
++        fetchK = VECTORSEARCH_FETCH_MAX;
++    }
++    if (fetchK < topK) {
++        fetchK = topK;
++    }
++    return fetchK;
++}
++
++static char* serialize_vectorsearch_query_vector(const float* values, int dim)
++{
++    StringInfoData buf;
++
++    initStringInfo(&buf);
++    for (int i = 0; i < dim; i++) {
++        if (i > 0) {
++            appendStringInfoChar(&buf, ',');
++        }
++        appendStringInfo(&buf, "%.9g", values[i]);
++    }
++    return buf.data;
++}
++
++static bool extract_vectorsearch_l2_info(Node* expr, Index relid, AttrNumber* vector_attnum, char** query_vector,
++    int* query_dim)
++{
++    OpExpr* op = NULL;
++    Node* arg1 = NULL;
++    Node* arg2 = NULL;
++    Var* vectorVar = NULL;
++    Const* queryConst = NULL;
++    PlannerVectorDatum* vector = NULL;
++
++    expr = strip_vectorsearch_relabel(expr);
++    if (expr == NULL || !IsA(expr, OpExpr)) {
++        return false;
++    }
++
++    op = (OpExpr*)expr;
++    if (op->opno != VECTOR_L2_OPERATOR_OID || list_length(op->args) != 2) {
++        return false;
++    }
++
++    arg1 = strip_vectorsearch_relabel((Node*)linitial(op->args));
++    arg2 = strip_vectorsearch_relabel((Node*)lsecond(op->args));
++    if (arg1 != NULL && IsA(arg1, Var) && arg2 != NULL && IsA(arg2, Const)) {
++        vectorVar = (Var*)arg1;
++        queryConst = (Const*)arg2;
++    } else if (arg2 != NULL && IsA(arg2, Var) && arg1 != NULL && IsA(arg1, Const)) {
++        vectorVar = (Var*)arg2;
++        queryConst = (Const*)arg1;
++    } else {
++        return false;
++    }
++
++    if (vectorVar->varno != relid || vectorVar->varattno <= 0 || queryConst->constisnull ||
++        queryConst->consttype != VECTOROID) {
++        return false;
++    }
++
++    vector = (PlannerVectorDatum*)PG_DETOAST_DATUM(queryConst->constvalue);
++    if (vector->dim <= 0) {
++        return false;
++    }
++
++    if (vector_attnum != NULL) {
++        *vector_attnum = vectorVar->varattno;
++    }
++    if (query_vector != NULL) {
++        *query_vector = serialize_vectorsearch_query_vector(vector->x, vector->dim);
++    }
++    if (query_dim != NULL) {
++        *query_dim = vector->dim;
++    }
++
++    return true;
++}
++
++static bool vectorsearch_topk_info_exists(PlannerInfo* root, Index relid, AttrNumber vector_attnum)
++{
++    ListCell* lc = NULL;
++
++    foreach (lc, root->vectorsearch_topk_infos) {
++        VectorSearchTopKInfo* info = (VectorSearchTopKInfo*)lfirst(lc);
++        if (info != NULL && info->relid == relid && info->vector_attnum == vector_attnum) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++static void set_vectorsearch_topk_info(PlannerInfo* root, RelOptInfo* rel)
++{
++    Query* parse = root->parse;
++    SortGroupClause* sortClause = NULL;
++    TargetEntry* sortTle = NULL;
++    AttrNumber vectorAttnum = InvalidAttrNumber;
++    char* queryVector = NULL;
++    int queryDim = 0;
++    int64 topK = 0;
++    VectorSearchTopKInfo* info = NULL;
++
++    if (!u_sess->attr.attr_sql.enable_vectorsearch || parse == NULL || rel == NULL || list_length(parse->sortClause) != 1) {
++        return;
++    }
++
++    if (!get_vectorsearch_const_limit_count(parse, &topK)) {
++        return;
++    }
++
++    sortClause = (SortGroupClause*)linitial(parse->sortClause);
++    if (sortClause == NULL || sortClause->sortop != FLOAT8LTOID || sortClause->nulls_first) {
++        return;
++    }
++
++    sortTle = get_sortgroupclause_tle(sortClause, parse->targetList, false);
++    if (sortTle == NULL ||
++        !extract_vectorsearch_l2_info((Node*)sortTle->expr, rel->relid, &vectorAttnum, &queryVector, &queryDim)) {
++        return;
++    }
++
++    if (vectorsearch_topk_info_exists(root, rel->relid, vectorAttnum)) {
++        return;
++    }
++
++    info = (VectorSearchTopKInfo*)palloc0(sizeof(VectorSearchTopKInfo));
++    info->relid = rel->relid;
++    info->vector_attnum = vectorAttnum;
++    info->topK = topK;
++    info->fetchK = vectorsearch_compute_fetch_k(topK);
++    info->query_vector = queryVector;
++    info->query_dim = queryDim;
++    info->metric = (char*)"l2";
++    root->vectorsearch_topk_infos = lappend(root->vectorsearch_topk_infos, info);
++}
++
+ /*
+  * set_foreign_size
+  *		Set size estimates for a foreign table RTE
+@@ -1490,6 +1697,8 @@ static void set_foreign_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry*
+ 
+     AssertEreport(rel->fdwroutine, MOD_OPT, "");
+ 
++    set_vectorsearch_topk_info(root, rel);
++
+     /* Let FDW adjust the size estimates, if it can */
+     rel->fdwroutine->GetForeignRelSize(root, rel, rte->relid);
+ 
+@@ -4755,4 +4964,3 @@ void debug_print_rel(PlannerInfo* root, RelOptInfo* rel)
+ }
+ 
+ #endif /* OPTIMIZER_DEBUG */
+-
+diff --git a/src/gausskernel/optimizer/plan/planner.cpp b/src/gausskernel/optimizer/plan/planner.cpp
+index f38b5b0de545510a6a3588766400b962956a6a48..28aeee363f216504e4fd71f67f2bee48c55e78d9 100755
+--- a/src/gausskernel/optimizer/plan/planner.cpp
++++ b/src/gausskernel/optimizer/plan/planner.cpp
+@@ -23,12 +23,14 @@
+ #include "catalog/indexing.h"
+ #include "catalog/pg_cast.h"
+ #include "catalog/pg_operator.h"
++#include "catalog/pg_type.h"
+ #include "catalog/pg_constraint.h"
+ #include "catalog/pgxc_group.h"
+ #include "catalog/pgxc_node.h"
+ #include "executor/executor.h"
+ #include "executor/node/nodeAgg.h"
+ #include "executor/node/nodeRecursiveunion.h"
++#include "foreign/foreign.h"
+ #include "gaussdb_version.h"
+ #include "knl/knl_instance.h"
+ #include "miscadmin.h"
+@@ -127,9 +129,20 @@ const char* ESTIMATION_ITEM = "EstimationItem";
+ /* For performance reasons, memory context will be dropped only when the totalSpace larger than 1MB. */
+ #define MEMORY_CONTEXT_DELETE_THRESHOLD (1024 * 1024)
+ #define MEMORY_MAX_TOTAL_CONTEXT_THRESHOLD (1024 * 1024 * 1024)
++#define VECTOR_L2_OPERATOR_OID 8311
++#define VECTORSEARCH_FETCH_MULTIPLIER 5
++#define VECTORSEARCH_FETCH_MIN 50
++#define VECTORSEARCH_FETCH_MAX 10000
+ #define IS_NEED_FREE_MEMORY_CONTEXT(MemContext) \
+     ((MemContext) != NULL && ((AllocSetContext*)(MemContext))->totalSpace > MEMORY_CONTEXT_DELETE_THRESHOLD)
+ 
++typedef struct PlannerVectorDatum {
++    int32 vl_len_;
++    int16 dim;
++    uint16 isoValue;
++    float x[FLEXIBLE_ARRAY_MEMBER];
++} PlannerVectorDatum;
++
+ const static Oid VectorEngineUnsupportType[] = {
+     POINTOID,
+     LSEGOID,
+@@ -155,6 +168,7 @@ static void preprocess_rowmarks(PlannerInfo* root);
+ static double preprocess_limit(PlannerInfo* root, double tuple_fraction, int64* offset_est, int64* count_est);
+ static void process_sort(Query* parse, PlannerInfo* root, PlannerTargets* plannerTargets, Plan** resultPlan, 
+     List* tlist, List* collectiveGroupExpr, List** currentPathKeys, double limitTuples, FDWUpperRelCxt* ufdwCxt);
++static Plan* try_make_vectorsearch_from_sort(Query* parse, PlannerInfo* root, Sort* sortPlan, double limitTuples);
+ static void process_rowMarks(Query* parse, Plan** resultPlan, PlannerInfo* root, List** currentPathKeys, 
+     FDWUpperRelCxt* ufdwCxt);
+ static bool grouping_is_can_hash(Query* parse, AggClauseCosts* agg_costs);
+@@ -2869,6 +2883,347 @@ static bool need_pullup_userset_before_sort(List* sub_tlist)
+     return result;
+ }
+ 
++static bool get_const_limit_count(Query* parse, int64* topK)
++{
++    Const* limitConst = NULL;
++
++    if (parse->limitOffset != NULL || parse->limitCount == NULL || !IsA(parse->limitCount, Const)) {
++        return false;
++    }
++
++    limitConst = (Const*)parse->limitCount;
++    if (limitConst->constisnull) {
++        return false;
++    }
++
++    switch (limitConst->consttype) {
++        case INT8OID:
++            *topK = DatumGetInt64(limitConst->constvalue);
++            break;
++        case INT4OID:
++            *topK = DatumGetInt32(limitConst->constvalue);
++            break;
++        case INT2OID:
++            *topK = DatumGetInt16(limitConst->constvalue);
++            break;
++        default:
++            return false;
++    }
++
++    return *topK >= 0;
++}
++
++static bool is_vector_l2_distance_expr(Node* expr)
++{
++    OpExpr* op = NULL;
++
++    if (expr == NULL) {
++        return false;
++    }
++
++    while (IsA(expr, RelabelType)) {
++        expr = (Node*)((RelabelType*)expr)->arg;
++    }
++
++    if (!IsA(expr, OpExpr)) {
++        return false;
++    }
++
++    op = (OpExpr*)expr;
++    return op->opno == VECTOR_L2_OPERATOR_OID && list_length(op->args) == 2;
++}
++
++static Node* strip_vectorsearch_relabel(Node* expr)
++{
++    while (expr != NULL && IsA(expr, RelabelType)) {
++        expr = (Node*)((RelabelType*)expr)->arg;
++    }
++    return expr;
++}
++
++static int64 vectorsearch_compute_fetch_k(int64 topK)
++{
++    int64 fetchK;
++
++    if (topK <= 0) {
++        return topK;
++    }
++
++    fetchK = topK * VECTORSEARCH_FETCH_MULTIPLIER;
++    if (fetchK < VECTORSEARCH_FETCH_MIN) {
++        fetchK = VECTORSEARCH_FETCH_MIN;
++    }
++    if (fetchK < topK) {
++        fetchK = topK;
++    }
++    if (fetchK > VECTORSEARCH_FETCH_MAX) {
++        fetchK = VECTORSEARCH_FETCH_MAX;
++    }
++    if (fetchK < topK) {
++        fetchK = topK;
++    }
++    return fetchK;
++}
++
++static char* serialize_vectorsearch_query_vector(const float* values, int dim)
++{
++    StringInfoData buf;
++
++    initStringInfo(&buf);
++    for (int i = 0; i < dim; i++) {
++        if (i > 0) {
++            appendStringInfoChar(&buf, ',');
++        }
++        appendStringInfo(&buf, "%.9g", values[i]);
++    }
++    return buf.data;
++}
++
++static bool extract_vectorsearch_l2_hint(Node* expr, AttrNumber* vector_attnum, char** query_vector, int* query_dim)
++{
++    OpExpr* op = NULL;
++    Node* arg1 = NULL;
++    Node* arg2 = NULL;
++    Var* vector_var = NULL;
++    Const* query_const = NULL;
++    PlannerVectorDatum* vector = NULL;
++
++    if (vector_attnum != NULL) {
++        *vector_attnum = InvalidAttrNumber;
++    }
++    if (query_vector != NULL) {
++        *query_vector = NULL;
++    }
++    if (query_dim != NULL) {
++        *query_dim = 0;
++    }
++
++    expr = strip_vectorsearch_relabel(expr);
++    if (expr == NULL || !IsA(expr, OpExpr)) {
++        return false;
++    }
++
++    op = (OpExpr*)expr;
++    if (op->opno != VECTOR_L2_OPERATOR_OID || list_length(op->args) != 2) {
++        return false;
++    }
++
++    arg1 = strip_vectorsearch_relabel((Node*)linitial(op->args));
++    arg2 = strip_vectorsearch_relabel((Node*)lsecond(op->args));
++    if (arg1 != NULL && IsA(arg1, Var) && arg2 != NULL && IsA(arg2, Const)) {
++        vector_var = (Var*)arg1;
++        query_const = (Const*)arg2;
++    } else if (arg2 != NULL && IsA(arg2, Var) && arg1 != NULL && IsA(arg1, Const)) {
++        vector_var = (Var*)arg2;
++        query_const = (Const*)arg1;
++    } else {
++        return false;
++    }
++
++    if (vector_var->varattno <= 0 || query_const->constisnull || query_const->consttype != VECTOROID) {
++        return false;
++    }
++
++    vector = (PlannerVectorDatum*)PG_DETOAST_DATUM(query_const->constvalue);
++    if (vector->dim <= 0) {
++        return false;
++    }
++
++    if (vector_attnum != NULL) {
++        *vector_attnum = vector_var->varattno;
++    }
++    if (query_vector != NULL) {
++        *query_vector = serialize_vectorsearch_query_vector(vector->x, vector->dim);
++    }
++    if (query_dim != NULL) {
++        *query_dim = vector->dim;
++    }
++    return true;
++}
++
++static bool is_foreign_scan(Plan* plan)
++{
++    return plan != NULL && IsA(plan, ForeignScan) && OidIsValid(((ForeignScan*)plan)->scan_relid);
++}
++
++/*
++ * Return true if plan is a LOCAL GATHER (round-robin, consumerDop 1) over a
++ * parallel ForeignScan, and hand that child back through foreign_scan.
++ */
++static bool is_local_gather_foreign_scan(Plan* plan, Plan** foreign_scan)
++{
++    Stream* stream = NULL;
++    Plan* child = NULL;
++
++    if (foreign_scan != NULL) {
++        *foreign_scan = NULL;
++    }
++    if (plan == NULL || !IsA(plan, Stream)) {
++        return false;
++    }
++
++    stream = (Stream*)plan;
++    child = plan->lefttree;
++    if (stream->smpDesc.distriType != LOCAL_ROUNDROBIN || stream->smpDesc.consumerDop != 1 ||
++        stream->smpDesc.producerDop <= 1 || !is_foreign_scan(child)) {
++        return false;
++    }
++
++    /*
++     * Require a genuinely parallel child whose DOP matches producerDop. A serial
++     * child (dop <= 1) under a producerDop > 1 gather is inconsistent: accepting it
++     * lets confirm_parallel_info force the scan multi-threaded and re-scan the same
++     * data, or drive the FDW into a parallel DOP with no task group.
++     */
++    if (child->dop <= 1 || child->dop != stream->smpDesc.producerDop) {
++        return false;
++    }
++    if (foreign_scan != NULL) {
++        *foreign_scan = child;
++    }
++    return true;
++}
++
++/*
++ * Return true if the sort column (sort_col_idx) resolves to the same expression
++ * in both the LOCAL GATHER and its ForeignScan child, i.e. the gather does not
++ * rewrite the ordering column.
++ */
++static bool vectorsearch_local_gather_preserves_sort_col(Plan* gather, Plan* foreign_scan, AttrNumber sort_col_idx)
++{
++    TargetEntry* gather_tle = NULL;
++    TargetEntry* foreign_tle = NULL;
++
++    if (gather == NULL || foreign_scan == NULL) {
++        return false;
++    }
++
++    gather_tle = get_tle_by_resno(gather->targetlist, sort_col_idx);
++    foreign_tle = get_tle_by_resno(foreign_scan->targetlist, sort_col_idx);
++    return gather_tle != NULL && foreign_tle != NULL && equal(gather_tle->expr, foreign_tle->expr);
++}
++
++static Plan* try_make_vectorsearch_from_sort(Query* parse, PlannerInfo* root, Sort* sortPlan, double limitTuples)
++{
++    VectorSearch* node = NULL;
++    Plan* plan = NULL;
++    Plan* lefttree = NULL;
++    Plan* foreign_scan = NULL;
++    TargetEntry* sortTle = NULL;
++    int64 topK = 0;
++    int64 fetchK = 0;
++    char* queryVector = NULL;
++    int queryDim = 0;
++    bool need_local_gather = false;
++
++    if (!u_sess->attr.attr_sql.enable_vectorsearch) {
++        return (Plan*)sortPlan;
++    }
++
++    if (sortPlan == NULL || sortPlan->numCols != 1 || sortPlan->sortColIdx == NULL ||
++        sortPlan->sortOperators == NULL || sortPlan->collations == NULL || sortPlan->nullsFirst == NULL) {
++        return (Plan*)sortPlan;
++    }
++
++    if (sortPlan->sortOperators[0] != FLOAT8LTOID || sortPlan->nullsFirst[0]) {
++        return (Plan*)sortPlan;
++    }
++
++    if (!get_const_limit_count(parse, &topK)) {
++        return (Plan*)sortPlan;
++    }
++
++    lefttree = sortPlan->plan.lefttree;
++    if (!is_foreign_scan(lefttree)) {
++        if (!is_local_gather_foreign_scan(lefttree, &foreign_scan) ||
++            !vectorsearch_local_gather_preserves_sort_col(lefttree, foreign_scan, sortPlan->sortColIdx[0])) {
++            return (Plan*)sortPlan;
++        }
++    } else if (lefttree->dop > 1) {
++        /*
++         * make_sort_from_pathkeys skips the LOCAL GATHER when the LIMIT count is
++         * no larger than the per-worker row estimate, leaving a bare parallel
++         * ForeignScan here. Building VectorSearch at dop > 1 would make every
++         * worker emit a partition-local top-K, and the non-merging gather that
++         * parallel_limit_sort adds later would surface an interleaved, non-global
++         * result. Defer inserting the gather until the sort column is confirmed to
++         * be a supported vector distance, so a non-vector parallel sort keeps its
++         * original shape. create_local_gather copies the child targetlist, so the
++         * validation below resolves the same sort expression on the bare scan.
++         */
++        need_local_gather = true;
++    } else {
++        foreign_scan = lefttree;
++    }
++
++    sortTle = get_tle_by_resno(lefttree->targetlist, sortPlan->sortColIdx[0]);
++    if (sortTle == NULL || !is_vector_l2_distance_expr((Node*)sortTle->expr) ||
++        !extract_vectorsearch_l2_hint((Node*)sortTle->expr, NULL, &queryVector, &queryDim)) {
++        return (Plan*)sortPlan;
++    }
++
++    /*
++     * Sort column confirmed as a supported vector distance; only now reshape the
++     * plan. make_sort_from_pathkeys skipped the LOCAL GATHER because the LIMIT
++     * count fits the per-worker estimate, so insert it here and rebuild the Sort
++     * proxy over the gathered dop-1 input. Rebuilding re-costs the sort against
++     * the real VectorSearch shape (input cost now covers the gather, DOP drops to
++     * 1); copying the stale dop>1 cost onto VectorSearch would misprice EXPLAIN,
++     * cached plan selection and resource tracking.
++     */
++    if (need_local_gather) {
++        lefttree = create_local_gather(lefttree);
++        sortPlan = make_sort_from_pathkeys(root, lefttree, root->sort_pathkeys, limitTuples);
++        lefttree = sortPlan->plan.lefttree;
++    }
++
++    fetchK = vectorsearch_compute_fetch_k(topK);
++
++    node = makeNode(VectorSearch);
++    plan = &node->plan;
++
++    copy_plan_costsize(plan, (Plan*)sortPlan);
++    plan->targetlist = sortPlan->plan.targetlist;
++    plan->qual = NIL;
++    plan->lefttree = lefttree;
++    plan->righttree = NULL;
++    plan->hasUniqueResults = sortPlan->plan.hasUniqueResults;
++    plan->dop = sortPlan->plan.dop;
++    /*
++     * Inherit exec_nodes/exec_type/distributed_keys from the child, matching what
++     * make_sort sets on the Sort this node replaces. Without it exec_nodes stays
++     * NULL; a parallel plan then dereferences it in BuildStreamFlow (SetCheckInfo)
++     * at executor start and crashes. Serial plans never build the stream flow, so
++     * the gap only surfaces under a LOCAL GATHER child.
++     */
++    inherit_plan_locator_info(plan, lefttree);
++
++    node->numCols = sortPlan->numCols;
++    node->sortColIdx = (AttrNumber*)palloc(sizeof(AttrNumber) * sortPlan->numCols);
++    node->sortOperators = (Oid*)palloc(sizeof(Oid) * sortPlan->numCols);
++    node->collations = (Oid*)palloc(sizeof(Oid) * sortPlan->numCols);
++    node->nullsFirst = (bool*)palloc(sizeof(bool) * sortPlan->numCols);
++    errno_t rc = memcpy_s(node->sortColIdx, sizeof(AttrNumber) * sortPlan->numCols,
++        sortPlan->sortColIdx, sizeof(AttrNumber) * sortPlan->numCols);
++    securec_check(rc, "\0", "\0");
++    rc = memcpy_s(node->sortOperators, sizeof(Oid) * sortPlan->numCols,
++        sortPlan->sortOperators, sizeof(Oid) * sortPlan->numCols);
++    securec_check(rc, "\0", "\0");
++    rc = memcpy_s(node->collations, sizeof(Oid) * sortPlan->numCols,
++        sortPlan->collations, sizeof(Oid) * sortPlan->numCols);
++    securec_check(rc, "\0", "\0");
++    rc = memcpy_s(node->nullsFirst, sizeof(bool) * sortPlan->numCols,
++        sortPlan->nullsFirst, sizeof(bool) * sortPlan->numCols);
++    securec_check(rc, "\0", "\0");
++
++    node->topK = topK;
++    node->fetchK = fetchK;
++    node->algorithm = VECTORSEARCH_ALGO_TOPK;
++    node->metric = VECTORSEARCH_METRIC_L2;
++
++    return (Plan*)node;
++}
++
+ static void process_sort(Query* parse, PlannerInfo* root, PlannerTargets* plannerTargets, Plan** resultPlan, 
+     List* tlist, List* collectiveGroupExpr, List** currentPathKeys, double limitTuples, FDWUpperRelCxt* ufdwCxt) 
+ {
+@@ -2895,7 +3250,8 @@ static void process_sort(Query* parse, PlannerInfo* root, PlannerTargets* planne
+         /* we also need to add sort if the sub node is parallized. */
+         if (!pathkeys_contained_in(root->sort_pathkeys, *currentPathKeys) ||
+             ((*resultPlan)->dop > 1 && root->sort_pathkeys)) {
+-            *resultPlan = (Plan*)make_sort_from_pathkeys(root, *resultPlan, root->sort_pathkeys, limitTuples);
++            Sort* sortPlan = make_sort_from_pathkeys(root, *resultPlan, root->sort_pathkeys, limitTuples);
++            *resultPlan = try_make_vectorsearch_from_sort(parse, root, sortPlan, limitTuples);
+ #ifdef STREAMPLAN
+             if (IS_STREAM_PLAN && check_sort_for_upsert(root))
+                 *resultPlan = make_stream_sort(root, *resultPlan);
+diff --git a/src/gausskernel/optimizer/plan/setrefs.cpp b/src/gausskernel/optimizer/plan/setrefs.cpp
+index d5cbc3cc7acf2aa1ead11b2795e7f5751726454c..9a48159ffd1c2c1ac76e132452b79dd50fa11ab8 100644
+--- a/src/gausskernel/optimizer/plan/setrefs.cpp
++++ b/src/gausskernel/optimizer/plan/setrefs.cpp
+@@ -649,6 +649,7 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
+         case T_Memoize:
+         case T_VecMaterial:
+         case T_Sort:
++        case T_VectorSearch:
+         case T_SortGroup:
+         case T_VecSort:
+         case T_Unique:
+diff --git a/src/gausskernel/optimizer/util/optcommon.cpp b/src/gausskernel/optimizer/util/optcommon.cpp
+index 5c846711ae12a94883edc969b39045ebf268d2a1..e8f75715e1aef069f7c6977de2abb1c30c9ada6f 100755
+--- a/src/gausskernel/optimizer/util/optcommon.cpp
++++ b/src/gausskernel/optimizer/util/optcommon.cpp
+@@ -431,6 +431,9 @@ void GetPlanNodePlainText(
+         case T_Sort:
+             *pname = *sname = *pt_operation = "Sort";
+             break;
++        case T_VectorSearch:
++            *pname = *sname = *pt_operation = "Vector Search";
++            break;
+         case T_SortGroup:
+             *pname = *sname = *pt_operation = "Group Sort";
+             break;
+diff --git a/src/gausskernel/process/globalplancache/globalplancache_util.cpp b/src/gausskernel/process/globalplancache/globalplancache_util.cpp
+index 886908a81f2b2aa6d03324cfd3fad7c4fa043f62..8bee849282819ebf486d496997075fc9d39cb268 100644
+--- a/src/gausskernel/process/globalplancache/globalplancache_util.cpp
++++ b/src/gausskernel/process/globalplancache/globalplancache_util.cpp
+@@ -126,6 +126,7 @@ GlobalPlanCache::FillEnvSignatures(GPCEnv *env)
+     env->plainenv.env_signature2 |= u_sess->attr.attr_sql.enable_opfusion << 17;
+     env->plainenv.env_signature2 |= u_sess->attr.attr_sql.enable_partition_opfusion << 18;
+     env->plainenv.env_signature2 |= u_sess->attr.attr_sql.partition_iterator_elimination << 19;
++    env->plainenv.env_signature2 |= u_sess->attr.attr_sql.enable_vectorsearch << 20;
+ }
+ 
+ void
+@@ -791,4 +792,3 @@ bool SPIParseEnableGPC(const Node *node)
+     /* keep compiler quite */
+     return false;
+ }
+-
+diff --git a/src/gausskernel/runtime/executor/Makefile b/src/gausskernel/runtime/executor/Makefile
+index 5d8f88857c317cb42b7649f3a1c92ba5023a9357..bebf13c41a640fea17cf00ac88957de34a5f06f3 100644
+--- a/src/gausskernel/runtime/executor/Makefile
++++ b/src/gausskernel/runtime/executor/Makefile
+@@ -44,7 +44,7 @@ OBJS = execAmi.o execCurrent.o execGrouping.o execJunk.o execMain.o \
+        nodeMaterial.o nodeMergeAppend.o nodeMergejoin.o nodeModifyTable.o \
+        nodeNestloop.o nodeFunctionscan.o nodeRecursiveunion.o nodeResult.o \
+        nodeSamplescan.o nodeSeqscan.o nodeSetOp.o nodeSort.o nodeUnique.o \
+-       nodeValuesscan.o nodeCtescan.o nodeStartWithOp.o nodeWorktablescan.o \
++       nodeValuesscan.o nodeCtescan.o nodeStartWithOp.o nodeWorktablescan.o nodeVectorSearch.o \
+        nodeGroup.o nodeSubplan.o nodeSubqueryscan.o nodeTidscan.o nodeTidrangescan.o \
+        nodeForeignscan.o nodeWindowAgg.o tstoreReceiver.o spi.o \
+        nodePartIterator.o nodeStub.o execClusterResize.o lightProxy.o execMerge.o \
+diff --git a/src/gausskernel/runtime/executor/execAmi.cpp b/src/gausskernel/runtime/executor/execAmi.cpp
+index a6a4602f61cf8d7f01656356419bb9be7adfb2f6..1fb257c2a0fb525342ec2be018a3396087c8036d 100755
+--- a/src/gausskernel/runtime/executor/execAmi.cpp
++++ b/src/gausskernel/runtime/executor/execAmi.cpp
+@@ -48,6 +48,7 @@
+ #include "executor/node/nodeSeqscan.h"
+ #include "executor/node/nodeSetOp.h"
+ #include "executor/node/nodeSort.h"
++#include "executor/node/nodeVectorSearch.h"
+ #include "executor/node/nodeSubplan.h"
+ #include "executor/node/nodeSubqueryscan.h"
+ #include "executor/node/nodeTableFuncscan.h"
+@@ -269,6 +270,10 @@ void ExecReScanByType(PlanState* node)
+         case T_SortState:
+             ExecReScanSort((SortState*)node);
+             break;
++
++        case T_VectorSearchState:
++            ExecReScanVectorSearch((VectorSearchState*)node);
++            break;
+         case T_SortGroupState:
+             ExecReScanSortGroup((SortGroupState*)node);
+             break;
+diff --git a/src/gausskernel/runtime/executor/execProcnode.cpp b/src/gausskernel/runtime/executor/execProcnode.cpp
+index 54f9dd4cc87792110e69700e369668f0e144ea28..6f875e306dc98039256fb1298230dbf8c699c871 100755
+--- a/src/gausskernel/runtime/executor/execProcnode.cpp
++++ b/src/gausskernel/runtime/executor/execProcnode.cpp
+@@ -105,6 +105,7 @@
+ #include "executor/node/nodeSeqscan.h"
+ #include "executor/node/nodeSetOp.h"
+ #include "executor/node/nodeSort.h"
++#include "executor/node/nodeVectorSearch.h"
+ #include "executor/node/nodeStub.h"
+ #include "executor/node/nodeSubplan.h"
+ #include "executor/node/nodeSubqueryscan.h"
+@@ -381,6 +382,8 @@ PlanState* ExecInitNodeByType(Plan* node, EState* estate, int eflags)
+             return (PlanState*)ExecInitMemoize((Memoize*)node, estate, eflags);
+         case T_Sort:
+             return (PlanState*)ExecInitSort((Sort*)node, estate, eflags);
++        case T_VectorSearch:
++            return (PlanState*)ExecInitVectorSearch((VectorSearch*)node, estate, eflags);
+         case T_SortGroup:
+             return (PlanState*)ExecInitSortGroup((SortGroup*)node, estate, eflags);
+         case T_Group:
+@@ -1289,6 +1292,10 @@ static void ExecEndNodeByType(PlanState* node)
+             ExecEndSort((SortState*)node);
+             break;
+ 
++        case T_VectorSearchState:
++            ExecEndVectorSearch((VectorSearchState*)node);
++            break;
++
+         case T_SortGroupState:
+             ExecEndSortGroup((SortGroupState*)node);
+             break;
+diff --git a/src/gausskernel/runtime/executor/nodeVectorSearch.cpp b/src/gausskernel/runtime/executor/nodeVectorSearch.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf26dbb776ad320785567fb06f4edb74ec4e8e39
+--- /dev/null
++++ b/src/gausskernel/runtime/executor/nodeVectorSearch.cpp
+@@ -0,0 +1,276 @@
++/* -------------------------------------------------------------------------
++ *
++ * nodeVectorSearch.cpp
++ *      Exact TopK vector search executor node.
++ *
++ * -------------------------------------------------------------------------
++ */
++#include "postgres.h"
++#include "knl/knl_variable.h"
++
++#include "access/tableam.h"
++#include "executor/exec/execdebug.h"
++#include "executor/node/nodeVectorSearch.h"
++#include "miscadmin.h"
++
++static TupleTableSlot* ExecVectorSearch(PlanState* state);
++
++static inline bool VectorSearchCandidateGreater(const VectorSearchCandidate* left, const VectorSearchCandidate* right)
++{
++    if (left->distance > right->distance) {
++        return true;
++    }
++    if (left->distance < right->distance) {
++        return false;
++    }
++    return left->seq > right->seq;
++}
++
++static void VectorSearchSwap(VectorSearchCandidate* left, VectorSearchCandidate* right)
++{
++    VectorSearchCandidate tmp = *left;
++    *left = *right;
++    *right = tmp;
++}
++
++static void VectorSearchHeapSiftUp(VectorSearchState* node, int64 index)
++{
++    while (index > 0) {
++        int64 parent = (index - 1) / 2;
++        if (!VectorSearchCandidateGreater(&node->candidates[index], &node->candidates[parent])) {
++            break;
++        }
++        VectorSearchSwap(&node->candidates[index], &node->candidates[parent]);
++        index = parent;
++    }
++}
++
++static void VectorSearchHeapSiftDown(VectorSearchState* node, int64 index)
++{
++    for (;;) {
++        int64 left = index * 2 + 1;
++        int64 right = left + 1;
++        int64 largest = index;
++
++        if (left < node->heapSize &&
++            VectorSearchCandidateGreater(&node->candidates[left], &node->candidates[largest])) {
++            largest = left;
++        }
++
++        if (right < node->heapSize &&
++            VectorSearchCandidateGreater(&node->candidates[right], &node->candidates[largest])) {
++            largest = right;
++        }
++
++        if (largest == index) {
++            break;
++        }
++
++        VectorSearchSwap(&node->candidates[index], &node->candidates[largest]);
++        index = largest;
++    }
++}
++
++static int VectorSearchResultCompare(const void* left, const void* right)
++{
++    const VectorSearchCandidate* l = (const VectorSearchCandidate*)left;
++    const VectorSearchCandidate* r = (const VectorSearchCandidate*)right;
++
++    if (l->distance < r->distance) {
++        return -1;
++    }
++    if (l->distance > r->distance) {
++        return 1;
++    }
++    if (l->seq < r->seq) {
++        return -1;
++    }
++    if (l->seq > r->seq) {
++        return 1;
++    }
++    return 0;
++}
++
++static void VectorSearchResetResults(VectorSearchState* node)
++{
++    if (node->tupleContext != NULL) {
++        MemoryContextReset(node->tupleContext);
++    }
++
++    node->search_Done = false;
++    node->heapSize = 0;
++    node->resultCount = 0;
++    node->resultIndex = 0;
++    node->inputRows = 0;
++    node->distanceComputations = 0;
++    node->seq = 0;
++    node->candidates = NULL;
++}
++
++static void VectorSearchSaveCandidate(VectorSearchState* node, TupleTableSlot* slot, double distance)
++{
++    MemoryContext oldContext = MemoryContextSwitchTo(node->tupleContext);
++    MinimalTuple tuple = ExecCopySlotMinimalTuple(slot);
++    MemoryContextSwitchTo(oldContext);
++
++    VectorSearchCandidate candidate;
++    candidate.tuple = tuple;
++    candidate.distance = distance;
++    candidate.seq = node->seq++;
++
++    if (node->heapSize < node->heapCapacity) {
++        node->candidates[node->heapSize] = candidate;
++        node->heapSize++;
++        VectorSearchHeapSiftUp(node, node->heapSize - 1);
++        return;
++    }
++
++    if (node->heapSize == 0 || !VectorSearchCandidateGreater(&node->candidates[0], &candidate)) {
++        heap_free_minimal_tuple(tuple);
++        return;
++    }
++
++    heap_free_minimal_tuple(node->candidates[0].tuple);
++    node->candidates[0] = candidate;
++    VectorSearchHeapSiftDown(node, 0);
++}
++
++static void VectorSearchBuildTopK(VectorSearchState* node)
++{
++    VectorSearch* plan = (VectorSearch*)node->ss.ps.plan;
++    PlanState* outerNode = outerPlanState(node);
++    AttrNumber distanceCol = plan->sortColIdx[0];
++    EState* estate = node->ss.ps.state;
++    ScanDirection oldDirection = estate->es_direction;
++
++    estate->es_direction = ForwardScanDirection;
++
++    MemoryContext oldContext = MemoryContextSwitchTo(node->tupleContext);
++    node->candidates = (VectorSearchCandidate*)palloc0(sizeof(VectorSearchCandidate) * node->heapCapacity);
++    MemoryContextSwitchTo(oldContext);
++
++    for (;;) {
++        bool isNull = false;
++        Datum distanceDatum;
++        double distance;
++        TupleTableSlot* slot = ExecProcNode(outerNode);
++
++        if (TupIsNull(slot)) {
++            break;
++        }
++
++        node->inputRows++;
++        distanceDatum = heap_slot_getattr(slot, distanceCol, &isNull);
++        if (isNull) {
++            continue;
++        }
++
++        distance = DatumGetFloat8(distanceDatum);
++        node->distanceComputations++;
++        VectorSearchSaveCandidate(node, slot, distance);
++    }
++
++    estate->es_direction = oldDirection;
++
++    node->resultCount = node->heapSize;
++    node->resultIndex = 0;
++
++    if (node->resultCount > 1) {
++        qsort(node->candidates, node->resultCount, sizeof(VectorSearchCandidate), VectorSearchResultCompare);
++    }
++
++    ExecEarlyFree(outerPlanState(node));
++    node->search_Done = true;
++}
++
++static TupleTableSlot* ExecVectorSearch(PlanState* state)
++{
++    VectorSearchState* node = castNode(VectorSearchState, state);
++    TupleTableSlot* resultSlot = node->ss.ps.ps_ResultTupleSlot;
++
++    CHECK_FOR_INTERRUPTS();
++
++    if (node->topK <= 0) {
++        return ExecClearTuple(resultSlot);
++    }
++
++    if (!node->search_Done) {
++        VectorSearchBuildTopK(node);
++    }
++
++    if (node->resultIndex >= node->resultCount) {
++        return ExecClearTuple(resultSlot);
++    }
++
++    return ExecStoreMinimalTuple(node->candidates[node->resultIndex++].tuple, resultSlot, false);
++}
++
++VectorSearchState* ExecInitVectorSearch(VectorSearch* node, EState* estate, int eflags)
++{
++    VectorSearchState* state = makeNode(VectorSearchState);
++
++    state->ss.ps.plan = (Plan*)node;
++    state->ss.ps.state = estate;
++    state->ss.ps.ExecProcNode = ExecVectorSearch;
++    state->topK = node->topK;
++    state->fetchK = node->fetchK;
++    state->heapCapacity = node->topK;
++    state->tupleContext = AllocSetContextCreate(CurrentMemoryContext,
++        "VectorSearch TopK context",
++        ALLOCSET_DEFAULT_SIZES);
++
++    ExecInitResultTupleSlot(estate, &state->ss.ps);
++    ExecInitScanTupleSlot(estate, &state->ss);
++
++    eflags &= ~(EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK);
++    outerPlanState(state) = ExecInitNode(outerPlan(node), estate, eflags);
++
++    ExecAssignScanTypeFromOuterPlan(&state->ss);
++    ExecAssignResultTypeFromTL(&state->ss.ps, state->ss.ss_ScanTupleSlot->tts_tupleDescriptor->td_tam_ops);
++    state->ss.ps.ps_ProjInfo = NULL;
++
++    VectorSearchResetResults(state);
++
++    return state;
++}
++
++void ExecEndVectorSearch(VectorSearchState* node)
++{
++    (void)ExecClearTuple(node->ss.ss_ScanTupleSlot);
++    (void)ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
++
++    if (node->tupleContext != NULL) {
++        MemoryContextDelete(node->tupleContext);
++        node->tupleContext = NULL;
++    }
++
++    ExecEndNode(outerPlanState(node));
++}
++
++void ExecReScanVectorSearch(VectorSearchState* node)
++{
++    /*
++     * The top-K result is fully materialized in node->candidates. Without a
++     * parameter change the child reproduces the same input, so rewind the result
++     * cursor and replay the cached candidates. This skips rescanning the child,
++     * and in particular avoids rescanning a LOCAL GATHER (Stream) child, which
++     * the executor forbids.
++     */
++    if (node->ss.ps.lefttree->chgParam == NULL) {
++        node->resultIndex = 0;
++        return;
++    }
++
++    /*
++     * A parameter change requires rebuilding from the child. A serial ForeignScan
++     * child is rescanned safely through chgParam propagation, but a parallel LOCAL
++     * GATHER (Stream) child cannot be rescanned. Such a shape should not reach a
++     * parameterized rescan; fail loudly instead of returning silently wrong rows.
++     */
++    if (IsA(node->ss.ps.lefttree, StreamState)) {
++        ereport(ERROR,
++            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++                errmsg("parallel vector top-K does not support rescan with changed parameters")));
++    }
++    VectorSearchResetResults(node);
++}
+diff --git a/src/include/executor/node/nodeVectorSearch.h b/src/include/executor/node/nodeVectorSearch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f31e45ec14e85564d1f7c86a36768b3c65f66278
+--- /dev/null
++++ b/src/include/executor/node/nodeVectorSearch.h
+@@ -0,0 +1,18 @@
++/* -------------------------------------------------------------------------
++ *
++ * nodeVectorSearch.h
++ *
++ * src/include/executor/nodeVectorSearch.h
++ *
++ * -------------------------------------------------------------------------
++ */
++#ifndef NODEVECTORSEARCH_H
++#define NODEVECTORSEARCH_H
++
++#include "nodes/execnodes.h"
++
++extern VectorSearchState* ExecInitVectorSearch(VectorSearch* node, EState* estate, int eflags);
++extern void ExecEndVectorSearch(VectorSearchState* node);
++extern void ExecReScanVectorSearch(VectorSearchState* node);
++
++#endif /* NODEVECTORSEARCH_H */
+diff --git a/src/include/knl/knl_guc/knl_session_attr_common.h b/src/include/knl/knl_guc/knl_session_attr_common.h
+index dbba1cedf62d4ce5020f795136abd47de30e9003..8d31d78276060e63e27d7f344b8daf9617d5d705 100644
+--- a/src/include/knl/knl_guc/knl_session_attr_common.h
++++ b/src/include/knl/knl_guc/knl_session_attr_common.h
+@@ -40,7 +40,9 @@
+ #define SRC_INCLUDE_KNL_KNL_SESSION_ATTR_COMMON_H_
+ 
+ #include "knl/knl_guc/knl_guc_common.h"
+-#include "plpython.h"
++
++/* Avoid forcing Python.h dependency on all translation units. */
++typedef struct PlySessionCtx PlySessionCtx;
+ 
+ typedef struct knl_session_attr_common {
+     bool enable_beta_features;
+diff --git a/src/include/knl/knl_guc/knl_session_attr_sql.h b/src/include/knl/knl_guc/knl_session_attr_sql.h
+index 5f3975b1f46cb551d6af755e4c4456a2802b4687..b216876a9fbb1f64ca5d23ee277b20a3f554f170 100644
+--- a/src/include/knl/knl_guc/knl_session_attr_sql.h
++++ b/src/include/knl/knl_guc/knl_session_attr_sql.h
+@@ -73,6 +73,7 @@ typedef struct knl_session_attr_sql {
+     bool enable_parallel_ddl;
+     bool enable_tidscan;
+     bool enable_sort;
++    bool enable_vectorsearch;
+     bool enable_compress_spill;
+     bool enable_hashagg;
+     bool enable_sortgroup_agg;
+@@ -294,4 +295,3 @@ typedef struct knl_session_attr_sql {
+ 
+ #endif /* SRC_INCLUDE_KNL_KNL_SESSION_ATTR_SQL */
+ 
+-
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index 6da28c51bc2d86e54ad7daefb4a63ef5b5000c3a..26fb154062c4a77af16319dad83164e332975b41 100755
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -2743,6 +2743,28 @@ typedef struct SortState {
+     int64* space_size;    /* spill size for temp table */
+ } SortState;
+ 
++typedef struct VectorSearchCandidate {
++    MinimalTuple tuple;
++    double distance;
++    uint64 seq;
++} VectorSearchCandidate;
++
++typedef struct VectorSearchState {
++    ScanState ss;
++    bool search_Done;
++    int64 topK;
++    int64 fetchK;
++    int64 heapSize;
++    int64 heapCapacity;
++    int64 resultCount;
++    int64 resultIndex;
++    uint64 inputRows;
++    uint64 distanceComputations;
++    uint64 seq;
++    VectorSearchCandidate* candidates;
++    MemoryContext tupleContext;
++} VectorSearchState;
++
+ struct SortGroupStatePriv;
+ /* ----------------
+  *	 SortGroupState information
+diff --git a/src/include/nodes/nodes.h b/src/include/nodes/nodes.h
+index f3e4310f85164e5ad6b9c91c2dd7e6f7d1c7e986..92fb45f994bfc3b5f1cdaccf9977cfb95b55edda 100755
+--- a/src/include/nodes/nodes.h
++++ b/src/include/nodes/nodes.h
+@@ -88,6 +88,7 @@ typedef enum NodeTag {
+     T_AsofJoin,
+     T_Material,
+     T_Sort,
++    T_VectorSearch,
+     T_SortGroup,
+     T_Group,
+     T_Agg,
+@@ -211,6 +212,7 @@ typedef enum NodeTag {
+     T_Memoize,
+     T_MemoizeState,
+     T_SortState,
++    T_VectorSearchState,
+     T_SortGroupState,
+     T_GroupState,
+     T_AggState,
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index bc8cc9c2e02f43b85fac135211dea2ecfc01ce54..eac4884dd3edb20f85975506d9b740d87cbe6dcb 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -1378,6 +1378,31 @@ typedef struct Sort {
+     OpMemInfo mem_info;    /* Memory info for sort */
+ } Sort;
+ 
++typedef enum VectorSearchAlgorithm {
++    VECTORSEARCH_ALGO_TOPK = 1
++} VectorSearchAlgorithm;
++
++typedef enum VectorSearchMetric {
++    VECTORSEARCH_METRIC_L2 = 1
++} VectorSearchMetric;
++
++/* ----------------
++ *      vector search node
++ * ----------------
++ */
++typedef struct VectorSearch {
++    Plan plan;
++    int numCols;            /* number of distance-key columns, first version requires 1 */
++    AttrNumber* sortColIdx; /* distance column indexes in the child target list */
++    Oid* sortOperators;     /* sort operator OIDs */
++    Oid* collations;        /* collation OIDs */
++    bool* nullsFirst;       /* NULLS FIRST/LAST flags */
++    int64 topK;             /* final number of tuples to keep */
++    int64 fetchK;           /* number of candidates requested from child scan */
++    VectorSearchAlgorithm algorithm;
++    VectorSearchMetric metric;
++} VectorSearch;
++
+ /* ----------------
+  * SortGroup node
+  * ----------------
+@@ -2026,4 +2051,3 @@ typedef enum DMLAction {
+ } DMLAction;
+ #endif /* USE_SPQ */
+ #endif /* PLANNODES_H */
+-
+diff --git a/src/include/nodes/relation.h b/src/include/nodes/relation.h
+index b731e326a07bf5c9675282233c43d7575ae51f3e..be2ff2272d020ba238ad01bbe5b5164e2487223a 100755
+--- a/src/include/nodes/relation.h
++++ b/src/include/nodes/relation.h
+@@ -298,6 +298,16 @@ struct PlannerTargets;
+  * the passed-in Query data structure; someday that should stop.
+  * ----------
+  */
++typedef struct VectorSearchTopKInfo {
++    Index relid;
++    AttrNumber vector_attnum;
++    int64 topK;
++    int64 fetchK;
++    char* query_vector;
++    int query_dim;
++    char* metric;
++} VectorSearchTopKInfo;
++
+ typedef struct PlannerInfo {
+     NodeTag type;
+ 
+@@ -429,6 +439,12 @@ typedef struct PlannerInfo {
+     double tuple_fraction; /* tuple_fraction passed to query_planner */
+     double limit_tuples;   /* limit_tuples passed to query_planner */
+ 
++    /*
++     * Vector topK metadata detected before FDW size/path callbacks.  FDWs can
++     * inspect this list in GetForeignRelSize/GetForeignPaths by matching relid.
++     */
++    List* vectorsearch_topk_infos;
++
+     bool hasInheritedTarget;     /* true if parse->resultRelation is an
+                                   * inheritance child rel */
+     bool hasJoinRTEs;            /* true if any RTEs are RTE_JOIN kind */
