@@ -15,7 +15,7 @@
 
 | 仓库 | commit | PR |
 | --- | --- | --- |
-| `iceberg-rust-bridge` | `e5fdef9` | [#112](https://github.com/DataInfraLab/iceberg-rust-bridge/pull/112) |
+| `iceberg-rust-bridge` | `20dc91e` | [#112](https://github.com/DataInfraLab/iceberg-rust-bridge/pull/112) |
 | `iceberg_delta` | `f0de207` | [#28](https://github.com/DataInfraLab/iceberg_delta/pull/28) |
 | `DataInfra-devtest` | `164e173` | [#66](https://github.com/DataInfraLab/DataInfra-devtest/pull/66) |
 
