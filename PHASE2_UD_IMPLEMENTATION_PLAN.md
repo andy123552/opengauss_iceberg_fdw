@@ -38,7 +38,7 @@
 
 ## 3. 阶段 0：基线和规格核对
 
-状态：TODO
+状态：已完成（2026-09-03；基线记录见 `artifacts/phase2-ud/20260903-stage0/baseline.md`）
 
 ### 0.1 物理机和依赖仓
 
@@ -73,7 +73,7 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 
 ## 4. 阶段 A：SDK DV 核心和 inspection
 
-状态：TODO
+状态：已完成（2026-09-03；SDK PR #15）
 
 ### A1. DV/Puffin
 
