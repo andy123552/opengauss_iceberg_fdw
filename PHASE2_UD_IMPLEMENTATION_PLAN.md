@@ -106,7 +106,7 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 
 ## 5. 阶段 B：Bridge、Delta、FDW、Catalog 集成
 
-状态：TODO
+状态：已完成（2026-09-03；详见 `artifacts/phase2-ud/20260903-stageB/stageB.md`）
 
 ### B1. Bridge v3 ABI
 
@@ -253,4 +253,3 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 ~~~
 
 禁止用修改 expected、关闭 filter、默认 format version、旧 .so、脏 worktree 或未记录 commit 掩盖问题；没有真实 backtrace 不能把普通 ERROR 当作 core。
-
