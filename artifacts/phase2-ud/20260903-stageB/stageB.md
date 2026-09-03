@@ -9,7 +9,7 @@
 - Bridge：为 format v3 RowDelta 增加 `deletion_vector_inputs` 请求路径。调用方只传递 `data_file_path`、物理位置和分区信息，由 Rust SDK 的 `PuffinWriter` 生成 deletion-vector-v1，并构造带 referenced data file、offset、length、cardinality 的 delete DataFile；保留 v2 Position Delete 兼容路径。
 - Delta：按 `_delta_op` 解析并按 data file 聚合位置；v2 继续写 Position Delete，v3 将位置输入交给 Bridge 生成 DV；UPDATE 在同一个 RowDelta 中提交 DV 与 after-image。
 - FDW/Catalog：本阶段未改代码。现有 FDW locator/ForeignModify 链路和 Catalog metadata CAS 接口可直接承载该请求；新增 v3 写入逻辑位于 Bridge/Delta 边界。
-- Devtest：更新 `delta/12_phase1_ud_e2e.sql`，v3 场景验证 flush 推进 snapshot 并清理 overlay；保留 v1 拒绝和 v2 既有断言，expected 文件无语义修改。
+- Devtest：更新 `delta/12_phase1_ud_e2e.sql`，v3 场景覆盖同一 flush 中的 UPDATE + DELETE，验证 flush 推进 snapshot 并清理 overlay；保留 v1 拒绝和 v2 既有断言，expected 仅同步受影响的行数。
 
 ## 提交和 PR
 
@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | `iceberg-rust-bridge` | `20dc91e` | [#112](https://github.com/DataInfraLab/iceberg-rust-bridge/pull/112) |
 | `iceberg_delta` | `f0de207` | [#28](https://github.com/DataInfraLab/iceberg_delta/pull/28) |
-| `DataInfra-devtest` | `164e173` | [#66](https://github.com/DataInfraLab/DataInfra-devtest/pull/66) |
+| `DataInfra-devtest` | `0874f10` | [#66](https://github.com/DataInfraLab/DataInfra-devtest/pull/66) |
 
 三个 PR 已推送到 `andy123552` fork，GitHub 当前未配置可报告的检查项（`gh pr checks` 显示 no checks reported），不能据此宣称 CI 通过。
 
