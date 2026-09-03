@@ -44,7 +44,7 @@ delta/12_phase1_ud_e2e
 
 结果：`passed=6 failed=0 xfailed=0 xpassed=0 skipped=0`。
 
-Bridge 额外执行 `cargo check --offline`，结果通过；Delta `git diff --check` 通过。
+Bridge 额外执行 `cargo check --offline` 和 `cargo test --test phase1_ud_regressions phase2_v3_row_delta_accepts_deletion_vector_inputs --offline`，结果均通过；Delta `git diff --check` 通过。
 
 ## 阶段边界
 
