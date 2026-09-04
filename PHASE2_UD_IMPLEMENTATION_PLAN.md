@@ -149,25 +149,26 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 
 ## 6. 阶段 C：端到端、并发和故障验收
 
-状态：TODO
+状态：进行中（2026-09-04；阶段记录见 `artifacts/phase2-ud/20260904-stageC/stageC.md`）
 
 ### C1. 版本和 DV 主路径
 
-- [ ] v1 gate 拒绝且无副作用。
-- [ ] v2 Position Delete 回归通过且无 DV。
-- [ ] v3 basic DELETE 单文件、单 DV、外部 reader 可见。
+- [x] v1 gate 拒绝且无副作用。
+- [x] v2 Position Delete 回归通过且无 DV。
+- [x] v3 basic DELETE 单文件、单 DV、外部 reader 可见。
 - [ ] capability 缺失时返回 Unsupported，overlay 保留。
 - [ ] 已有 DV、遗留 position delete、多文件/row group 合并通过。
 
 ### C2. U/D、schema 和 lineage
 
-- [ ] UPDATE 同一 snapshot 同时含 DV + after-image。
+- [x] UPDATE 同一 snapshot 同时含 DV + after-image。
 - [ ] RETURNING、NULL/residual、0 行 DML 通过。
-- [ ] UPDATE -> UPDATE -> DELETE 折叠通过。
+- [x] UPDATE -> UPDATE -> DELETE 折叠通过。
 - [ ] INSERT -> UPDATE 只写最终 data row。
 - [ ] INSERT -> DELETE 不写湖端文件。
-- [ ] 混合 I/U/D 同一 flush 原子提交。
-- [ ] partition/spec、schema evolution、MOR UNION targetlist 连续性通过。
+- [x] 混合 I/U/D 同一 flush 原子提交。
+- [x] partition/spec、MOR UNION targetlist 连续性通过。
+- [ ] schema evolution 连续 mutation 仍待验证。
 - [ ] row lineage 和 sequence 与 metadata/Parquet 一致。
 
 ### C3. 事务、冲突和恢复
