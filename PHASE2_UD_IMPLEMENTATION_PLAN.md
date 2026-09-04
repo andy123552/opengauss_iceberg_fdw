@@ -161,7 +161,7 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 
 ### C2. U/D、schema 和 lineage
 
-- [x] UPDATE 同一 snapshot 同时含 DV + after-image。
+- [ ] UPDATE 同一 snapshot 同时含 DV + after-image（尚待 metadata/manifest 黑盒核对）。
 - [ ] RETURNING、NULL/residual、0 行 DML 通过。
 - [x] UPDATE -> UPDATE -> DELETE 折叠通过。
 - [ ] INSERT -> UPDATE 只写最终 data row。
