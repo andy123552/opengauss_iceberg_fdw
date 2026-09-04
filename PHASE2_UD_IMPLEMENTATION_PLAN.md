@@ -225,7 +225,15 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 - [ ] 合入后 fetch main，重跑最小 smoke 和全量 watchdog。
 - [ ] issue/PR 关闭前确认没有把 SKIP 或独立测试框架问题误标为完成。
 
-### D4. 最终 summary
+### D4. 待合入 PR 全量检视（新增约束）
+
+- [ ] 对 SDK、Bridge、Delta、FDW、Catalog、Devtest 当前待合入 PR 逐一检视功能正确性、
+  ABI/内存所有权、错误处理、并发/CAS、回滚和测试充分性。
+- [ ] 结合各仓库其他 PR 的历史检视意见核对同类风险；可复现问题必须在对应 PR
+  提交 review comment，修复后重新检查。
+- [ ] PR head、diff、CI 状态和 review comment 均回读确认，未完成的检查不得标记为通过。
+
+### D5. 最终 summary
 
 在 artifacts/phase2-ud/<run-id>/summary.md 记录：
 
