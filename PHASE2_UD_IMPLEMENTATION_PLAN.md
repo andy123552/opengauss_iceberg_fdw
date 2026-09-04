@@ -235,6 +235,9 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 
 ### D5. 最终 summary
 
+阶段 D 后续问题的合并执行顺序、FDW 是否需要新增代码的判定门禁和当前剩余验收项，
+统一记录在 `artifacts/phase2-ud/20260904-stageD/follow-up-plan.md`。
+
 在 artifacts/phase2-ud/<run-id>/summary.md 记录：
 
 - [ ] 主机、warehouse、端口、时间；
