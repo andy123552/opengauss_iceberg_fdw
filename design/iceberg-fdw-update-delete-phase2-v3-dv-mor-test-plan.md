@@ -220,14 +220,29 @@ SELECT iceberg_delta.flush_table('phase2_ns', 'events_v3');
 
 预期：CAS 前 snapshot 不变；CAS 后按 recovery 规则处理；重试最多一个逻辑 DV/RowDelta；所有 orphan 可追踪。
 
-## 7. P2：兼容、边界和性能
+## 7. 阶段 C 已执行映射（2026-09-04）
+
+| 测试 ID | DataInfra-devtest 用例 | 结果 |
+| --- | --- | --- |
+| P0-01/P0-02/P0-03 | `delta/12_phase1_ud_e2e`、`delta/13_phase1_ud_edges` | PASS |
+| P1-01/P1-05 | `delta/12_phase1_ud_e2e`（v3 flush 后外部扫描可见性） | PASS |
+| P1-06 | `delta/14_phase2_v3_mutation_matrix`（连续 UPDATE、UPDATE→DELETE、混合操作） | PASS |
+| P1-08 | `delta/11_partition_flush`、`delta/13_phase1_ud_edges` | PASS |
+| 维护回归 | `catalog/05_phase1_maintenance_e2e`、`06_phase2_expire_snapshots_smoke`、`07_phase2_expire_snapshots_e2e` | PASS |
+
+以下场景尚未具备可宣称的通过证据：INSERT→UPDATE（FDW 尚未为 delta-only 行生成
+可用 locator）、已有 DV/遗留 Position Delete 的多文件黑盒合并、并发/CAS 冲突、完整
+故障点重试及 Puffin/manifest inspection。必须在后续阶段执行或明确登记 SKIP，不能以
+上述重点回归替代。
+
+## 8. P2：兼容、边界和性能
 
 - 移除带 DV 的 data file 后，metadata 不再引用该 DV；Puffin 可由后续 orphan 清理。
 - 覆盖 position=0、2^32-1、2^32 和最大允许正 64 位位置；非法负数和最高位为 1 拒绝。
 - 使用大表和稀疏 DV 验证 bitmap、Puffin 大小、扫描耗时和并发读；性能结果不能替代正确性。
 - 既有 equality delete、branch/tag/reference、S3/MinIO、NotFound 幂等按实际能力执行；缺少 fixture 或 API 时标记 SKIP。
 
-## 8. 覆盖率和三方验收断言
+## 9. 覆盖率和三方验收断言
 
 ### 8.1 Rust SDK
 
@@ -245,7 +260,7 @@ SELECT iceberg_delta.flush_table('phase2_ns', 'events_v3');
 
 每次运行在 artifacts/phase2-ud/<run-id>/summary.md 记录各仓 SHA、构建命令、每个 case 的 PASS/FAIL/SKIP、SQL/RETURNING、snapshot、metadata location、manifest、Puffin、row lineage、trace、server log、orphan、重试和覆盖率。
 
-## 9. 失败判定和禁止做法
+## 10. 失败判定和禁止做法
 
 以下情况必须判定 FAIL：
 
@@ -259,7 +274,7 @@ SELECT iceberg_delta.flush_table('phase2_ns', 'events_v3');
 - 将普通 ERROR 日志当作 core，或把 crash 归因于没有 backtrace 的猜测；
 - 未执行的并发、既有 delete file 或分区高阶场景标为 PASS。
 
-## 10. 最终验收顺序
+## 11. 最终验收顺序
 
 ~~~text
 SDK unit + inspection
@@ -271,4 +286,3 @@ SDK unit + inspection
   -> full devtest watchdog
   -> coverage and summary
 ~~~
-
