@@ -197,12 +197,12 @@ cd /data/ad/stack/data_infra/plugins/iceberg_delta/test/integrate
 
 ### D1. 全量回归
 
-- [ ] 执行 ad-build rust fdw catalog delta verify。
-- [ ] 运行阶段一 run.sh、10~14 号脚本和阶段二 20_run_phase2_v3_dv.sh。
-- [ ] 运行 DataInfra-devtest 默认 watchdog。
+- [x] 执行 ad-build rust fdw catalog delta verify（物理机通过）。
+- [x] 运行阶段一 run.sh、10~14 号脚本和阶段二 20_run_phase2_v3_dv.sh（阶段 C 定向回归通过）。
+- [x] 运行 DataInfra-devtest 默认 watchdog（正确 Rust 环境下 81 PASS，结果见 `artifacts/phase2-ud/20260904-stageD/full-watchdog.md`）。
 - [ ] 运行 opt-in S3/MinIO/重启/并发 schedule，不能把跳过当通过。
-- [ ] permission normalization 差异单独记录，不修改 expected 掩盖阶段二结果。
-- [ ] 验证加载的是本次 commit 产物。
+- [x] permission normalization 差异单独记录，不修改 expected 掩盖阶段二结果。
+- [x] 验证加载的是本次 commit 产物。
 
 ### D2. 覆盖率
 

@@ -26,4 +26,5 @@
 ## 检视结论
 
 - 四个 PR 均显示 `MERGEABLE`，但 SDK CI 仍处于 queued/pending，其他三个 PR 没有 checks，不能据此宣称通过全量验收。
-- 物理机组件构建和阶段 C 定向回归已通过；黑盒 DV 元数据、CAS/并发、故障恢复和覆盖率仍是阶段 D 后续工作。
+- 物理机组件构建和阶段 C 定向回归已通过。阶段 D 默认全量看护在补齐 rustup Cargo 路径后为 81 PASS、2 个既有权限输出差异、1 个预期 XFAIL、40 个 opt-in SKIP；详见同目录 `full-watchdog.md`。
+- 黑盒 DV 元数据、CAS/并发、故障恢复和覆盖率仍是阶段 D 后续工作；在这些 review 意见闭环且 SDK CI 完成前，不应合入或将阶段 D 标记为全部通过。
